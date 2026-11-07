@@ -80,7 +80,11 @@ cargo llvm-cov --summary-only            # a table per file
 cargo llvm-cov --html --open             # each line, in the browser
 ```
 
-About 99% of lines run. The rest is the fallback for a response that fails to serialize, which these types can't do.
+Coverage isn't 100%, on purpose:
+
+- **Lines (about 99%).** Counting a line as covered when any test runs it, only two lines never run: the fallback for a response that fails to serialize, which these types can't do. The table shows a few more missed lines because it counts some code more than once. Generic code is counted once per type it's used with: the receiver is compiled with the in-memory storage, which can't fail, and with a test storage that can, and the "storage write failed" branch only runs with the second. The library is also counted once per test file, so code that one test file never uses shows as missed there even when another runs it.
+- **Regions (about 97%).** Regions are pieces of a line. Most of the missed ones are the error side of `?` on checks that can't fail, such as converting a number that was already range-checked to a smaller type. If one ever did fail, the command would get an "internal error" response rather than crash the receiver.
+- **Why not chase 100%.** It would mean deleting those defensive checks, or adding code whose only job is to let tests force failures that can't happen. Mutation testing, below, is the stronger evidence that the tests would catch a bug.
 
 **Mutation testing**: makes small changes to the code (flips a `<`, deletes a line, returns a default) and checks that a test fails for each one.
 
