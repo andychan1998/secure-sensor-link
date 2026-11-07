@@ -22,8 +22,9 @@ use crate::key::{Key, KeyId};
 #[derive(Debug)]
 pub struct Keyring {
     slots: BTreeMap<KeyId, Slot>,
-    /// The highest key id used by an accepted frame, if any.
-    current: Option<KeyId>,
+    /// The key the camera is on: the highest key id used by an accepted
+    /// frame, or key 0 until then. Always provisioned (keys are never removed).
+    current: KeyId,
 }
 
 #[derive(Debug)]
@@ -67,14 +68,6 @@ impl fmt::Display for Unusable {
     }
 }
 
-/// What `add_key` will do, decided before anything changes.
-#[derive(Debug)]
-pub enum AddKey {
-    /// The same key is already provisioned under this id: nothing to do.
-    AlreadyPresent,
-    Insert(KeyId, Key),
-}
-
 /// Why `add_key` was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddKeyError {
@@ -88,20 +81,13 @@ pub enum AddKeyError {
     DifferentKey,
 }
 
-/// What `revoke_key` will do, decided before anything changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Revoke {
-    AlreadyRevoked,
-    Revoke(KeyId),
-}
-
 impl Keyring {
     /// A camera's keys after `init`: one usable key, key 0.
     #[must_use]
     pub fn new(initial: Key) -> Self {
         Self {
             slots: BTreeMap::from([(KeyId::INITIAL, Slot::Usable(initial))]),
-            current: None,
+            current: KeyId::INITIAL,
         }
     }
 
@@ -116,77 +102,95 @@ impl Keyring {
             None => Err(Unusable::NotProvisioned),
             Some(Slot::Revoked) => Err(Unusable::Revoked),
             Some(Slot::Retired) => Err(Unusable::Retired),
-            // Usable slots are never below the current key: `mark_used` retires
-            // them and `plan_add` refuses them.
+            // Usable slots are never below the current key: `after_use` retires
+            // them and `with_added` refuses them.
             Some(Slot::Usable(key)) => Ok(key),
         }
     }
 
-    /// Records that a frame using `id` was accepted: every lower key is now
-    /// retired, and its bytes are erased. Can't fail.
-    pub fn mark_used(&mut self, id: KeyId) {
-        if self.current.is_some_and(|current| current >= id) {
-            return;
+    /// The keys after a frame using `id` is accepted, or `None` if nothing
+    /// changes. Using a key above the current one moves the camera to it and
+    /// retires every lower key; the new keyring holds no copy of their bytes.
+    #[must_use]
+    pub fn after_use(&self, id: KeyId) -> Option<Self> {
+        if id <= self.current {
+            return None;
         }
-        self.current = Some(id);
-        for (_, slot) in self.slots.range_mut(..id) {
+        let mut next = self.duplicate();
+        next.current = id;
+        for (_, slot) in next.slots.range_mut(..id) {
             if matches!(slot, Slot::Usable(_)) {
                 // Dropping the old key erases its bytes.
                 *slot = Slot::Retired;
             }
         }
+        Some(next)
     }
 
-    /// Decides what adding `key` under `id` does, without changing anything.
+    /// The keys with `key` added as `id`, or `None` if that exact key is
+    /// already provisioned under `id`.
     ///
     /// # Errors
     ///
     /// Returns why the key can't be added.
-    pub fn plan_add(&self, id: KeyId, key: Key) -> Result<AddKey, AddKeyError> {
+    pub fn with_added(&self, id: KeyId, key: Key) -> Result<Option<Self>, AddKeyError> {
         match self.slots.get(&id) {
             Some(Slot::Revoked) => Err(AddKeyError::Revoked),
             Some(Slot::Retired) => Err(AddKeyError::Retired),
             Some(Slot::Usable(existing)) => {
                 if existing.ct_eq(&key) {
-                    Ok(AddKey::AlreadyPresent)
+                    Ok(None)
                 } else {
                     Err(AddKeyError::DifferentKey)
                 }
             }
-            None => match self.current {
-                Some(current) if id < current => Err(AddKeyError::BelowCurrent { current }),
-                _ => Ok(AddKey::Insert(id, key)),
-            },
+            None if id < self.current => Err(AddKeyError::BelowCurrent {
+                current: self.current,
+            }),
+            None => {
+                let mut next = self.duplicate();
+                next.slots.insert(id, Slot::Usable(key));
+                Ok(Some(next))
+            }
         }
     }
 
-    /// Carries out a plan from [`Keyring::plan_add`].
-    pub fn apply_add(&mut self, plan: AddKey) {
-        if let AddKey::Insert(id, key) = plan {
-            self.slots.insert(id, Slot::Usable(key));
-        }
-    }
-
-    /// Decides what revoking `id` does, without changing anything.
+    /// The keys with `id` revoked, or `None` if it already is.
     ///
     /// # Errors
     ///
     /// Returns [`Unusable::NotProvisioned`] if `id` was never provisioned.
-    pub fn plan_revoke(&self, id: KeyId) -> Result<Revoke, Unusable> {
+    pub fn with_revoked(&self, id: KeyId) -> Result<Option<Self>, Unusable> {
         match self.slots.get(&id) {
             None => Err(Unusable::NotProvisioned),
-            Some(Slot::Revoked) => Ok(Revoke::AlreadyRevoked),
-            Some(Slot::Usable(_) | Slot::Retired) => Ok(Revoke::Revoke(id)),
+            Some(Slot::Revoked) => Ok(None),
+            Some(Slot::Usable(_) | Slot::Retired) => {
+                let mut next = self.duplicate();
+                // Dropping a usable key erases its bytes.
+                next.slots.insert(id, Slot::Revoked);
+                Ok(Some(next))
+            }
         }
     }
 
-    /// Carries out a plan from [`Keyring::plan_revoke`]. Can't fail.
-    pub fn apply_revoke(&mut self, plan: Revoke) {
-        if let Revoke::Revoke(id) = plan
-            && let Some(slot) = self.slots.get_mut(&id)
-        {
-            // Dropping a usable key erases its bytes.
-            *slot = Slot::Revoked;
+    /// An explicit copy, made only for storage and for planning a change. Keys
+    /// are copied with [`Key::duplicate`].
+    #[must_use]
+    pub(crate) fn duplicate(&self) -> Self {
+        Self {
+            slots: self
+                .slots
+                .iter()
+                .map(|(&id, slot)| {
+                    let slot = match slot {
+                        Slot::Usable(key) => Slot::Usable(key.duplicate()),
+                        Slot::Retired => Slot::Retired,
+                        Slot::Revoked => Slot::Revoked,
+                    };
+                    (id, slot)
+                })
+                .collect(),
+            current: self.current,
         }
     }
 
@@ -222,6 +226,10 @@ mod tests {
             .collect()
     }
 
+    fn added(ring: &Keyring, id: u8, byte: u8) -> Keyring {
+        ring.with_added(KeyId(id), key(byte)).unwrap().unwrap()
+    }
+
     #[test]
     fn starts_with_key_zero_active() {
         let ring = Keyring::new(key(1));
@@ -232,12 +240,8 @@ mod tests {
 
     #[test]
     fn using_a_higher_key_retires_the_lower_ones() {
-        let mut ring = Keyring::new(key(1));
-        let plan = ring.plan_add(KeyId(2), key(2)).unwrap();
-        ring.apply_add(plan);
-        let plan = ring.plan_add(KeyId(5), key(5)).unwrap();
-        ring.apply_add(plan);
-        ring.mark_used(KeyId(2));
+        let ring = added(&added(&Keyring::new(key(1)), 2, 2), 5, 5);
+        let ring = ring.after_use(KeyId(2)).unwrap();
         assert_eq!(
             statuses(&ring),
             vec![
@@ -247,77 +251,100 @@ mod tests {
             ]
         );
         assert_eq!(ring.usable(KeyId(0)).unwrap_err(), Unusable::Retired);
-        assert!(ring.usable(KeyId(2)).is_ok());
-        // Using a lower key later can't happen (it's rejected), and changes nothing.
-        ring.mark_used(KeyId(0));
-        assert!(ring.usable(KeyId(2)).is_ok());
+        assert!(ring.usable(KeyId(2)).unwrap().ct_eq(&key(2)));
+        // Using the current key or a lower one changes nothing.
+        assert!(ring.after_use(KeyId(2)).is_none());
+        assert!(ring.after_use(KeyId(0)).is_none());
+        // Moving on again.
+        let ring = ring.after_use(KeyId(5)).unwrap();
+        assert_eq!(ring.usable(KeyId(2)).unwrap_err(), Unusable::Retired);
+    }
+
+    #[test]
+    fn a_camera_starts_on_key_zero() {
+        let ring = Keyring::new(key(1));
+        assert!(ring.after_use(KeyId(0)).is_none(), "nothing changes");
+        // Key 1 can be added: it isn't below the current key.
+        added(&ring, 1, 2);
     }
 
     #[test]
     fn add_key_rules() {
-        let mut ring = Keyring::new(key(1));
+        let ring = Keyring::new(key(1));
         // Same bytes under the same id: nothing to do. Different bytes: refused.
-        assert!(matches!(
-            ring.plan_add(KeyId(0), key(1)),
-            Ok(AddKey::AlreadyPresent)
-        ));
+        assert!(ring.with_added(KeyId(0), key(1)).unwrap().is_none());
         assert_eq!(
-            ring.plan_add(KeyId(0), key(9)).unwrap_err(),
+            ring.with_added(KeyId(0), key(9)).unwrap_err(),
             AddKeyError::DifferentKey
         );
-        let plan = ring.plan_add(KeyId(3), key(3)).unwrap();
-        ring.apply_add(plan);
-        ring.mark_used(KeyId(3));
+        let ring = added(&ring, 3, 3).after_use(KeyId(3)).unwrap();
         // Below the current key: retired, or would be retired at once.
         assert_eq!(
-            ring.plan_add(KeyId(0), key(1)).unwrap_err(),
+            ring.with_added(KeyId(0), key(1)).unwrap_err(),
             AddKeyError::Retired
         );
         assert_eq!(
-            ring.plan_add(KeyId(2), key(2)).unwrap_err(),
+            ring.with_added(KeyId(2), key(2)).unwrap_err(),
             AddKeyError::BelowCurrent { current: KeyId(3) }
         );
         // Revoked ids never come back, even with the same bytes.
-        let plan = ring.plan_revoke(KeyId(3)).unwrap();
-        ring.apply_revoke(plan);
+        let ring = ring.with_revoked(KeyId(3)).unwrap().unwrap();
         assert_eq!(
-            ring.plan_add(KeyId(3), key(3)).unwrap_err(),
+            ring.with_added(KeyId(3), key(3)).unwrap_err(),
             AddKeyError::Revoked
         );
         // Above the current key: fine.
-        assert!(matches!(
-            ring.plan_add(KeyId(255), key(7)),
-            Ok(AddKey::Insert(KeyId(255), _))
-        ));
+        let ring = added(&ring, 255, 7);
+        assert!(ring.usable(KeyId(255)).unwrap().ct_eq(&key(7)));
     }
 
     #[test]
     fn revoke_rules() {
-        let mut ring = Keyring::new(key(1));
+        let ring = Keyring::new(key(1));
         assert_eq!(
-            ring.plan_revoke(KeyId(7)).unwrap_err(),
+            ring.with_revoked(KeyId(7)).unwrap_err(),
             Unusable::NotProvisioned
         );
-        let plan = ring.plan_revoke(KeyId(0)).unwrap();
-        assert_eq!(plan, Revoke::Revoke(KeyId(0)));
-        ring.apply_revoke(plan);
+        let ring = ring.with_revoked(KeyId(0)).unwrap().unwrap();
         assert_eq!(ring.usable(KeyId(0)).unwrap_err(), Unusable::Revoked);
-        assert_eq!(ring.plan_revoke(KeyId(0)).unwrap(), Revoke::AlreadyRevoked);
+        assert!(ring.with_revoked(KeyId(0)).unwrap().is_none());
         assert_eq!(statuses(&ring), vec![(0, KeyStatus::Revoked)]);
     }
 
     #[test]
     fn a_retired_key_can_be_revoked() {
-        let mut ring = Keyring::new(key(1));
-        let plan = ring.plan_add(KeyId(1), key(2)).unwrap();
-        ring.apply_add(plan);
-        ring.mark_used(KeyId(1));
-        let plan = ring.plan_revoke(KeyId(0)).unwrap();
-        ring.apply_revoke(plan);
+        let ring = added(&Keyring::new(key(1)), 1, 2)
+            .after_use(KeyId(1))
+            .unwrap();
+        let ring = ring.with_revoked(KeyId(0)).unwrap().unwrap();
         assert_eq!(
             statuses(&ring),
             vec![(0, KeyStatus::Revoked), (1, KeyStatus::Active)]
         );
         assert_eq!(ring.usable(KeyId(0)).unwrap_err(), Unusable::Revoked);
+    }
+
+    #[test]
+    fn planning_a_change_leaves_the_original_alone() {
+        let ring = Keyring::new(key(1));
+        let _ = ring.with_revoked(KeyId(0)).unwrap();
+        let _ = ring.with_added(KeyId(1), key(2)).unwrap();
+        let _ = ring.after_use(KeyId(1));
+        assert_eq!(statuses(&ring), vec![(0, KeyStatus::Active)]);
+    }
+
+    #[test]
+    fn a_duplicate_has_the_same_keys_and_current_key() {
+        let ring = added(&Keyring::new(key(1)), 4, 4)
+            .after_use(KeyId(4))
+            .unwrap();
+        let copy = ring.duplicate();
+        assert_eq!(statuses(&copy), statuses(&ring));
+        assert!(copy.usable(KeyId(4)).unwrap().ct_eq(&key(4)));
+        // The current key came along: key 3 is below it.
+        assert_eq!(
+            copy.with_added(KeyId(3), key(3)).unwrap_err(),
+            AddKeyError::BelowCurrent { current: KeyId(4) }
+        );
     }
 }

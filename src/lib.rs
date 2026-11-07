@@ -9,10 +9,12 @@
 //!    reads before the tag, just enough to pick the key and find the tag;
 //! 4. key status: provisioned, not revoked, not retired;
 //! 5. the HMAC-SHA256 tag, compared in constant time;
-//! 6. replay (seq above the last accepted);
+//! 6. replay: seq above the last accepted and, after a restart, above the
+//!    floor saved in storage;
 //! 7. timestamp not negative;
 //! 8. the tree, within its size limits;
-//! 9. commit: timestamp correction, queues and pairing.
+//! 9. commit: first storage (replay floor, key changes), then memory
+//!    (timestamp correction, queues and pairing).
 
 // Tests may use plain arithmetic and string slicing on fixed test data; the
 // production code is still checked in the normal (non-test) build.
@@ -28,11 +30,13 @@
 
 pub mod camera;
 pub mod config;
+pub mod floor;
 pub mod frame;
 pub mod key;
 pub mod keyring;
 pub mod protocol;
 pub mod receiver;
+pub mod storage;
 pub mod sync;
 pub mod timeline;
 pub mod tree;

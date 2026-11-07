@@ -1,8 +1,8 @@
 //! Random tests against a reference model.
 //!
 //! The model below is a deliberately plain, separate implementation of the
-//! spec's rules (keys, replay, timestamp correction, pairing) with none of the
-//! receiver's structure. Random command sequences go to both, and after every
+//! spec's rules (keys, replay, restarts, timestamp correction, pairing) with
+//! none of the receiver's structure. Random command sequences go to both, and after every
 //! command the response and the full state must agree. Along the way this
 //! checks that a rejected frame changes nothing, queues never exceed
 //! `max_pending`, and every accepted frame ends up paired, unpaired or pending.
@@ -29,7 +29,8 @@ use std::collections::{BTreeMap, VecDeque};
 use proptest::prelude::*;
 use serde_json::{Value, json};
 use support::{
-    Frame, Harness, KEY1, KEY2, add_key_line, init_line, leaf, receive_line, revoke_key_line,
+    Frame, Harness, KEY1, KEY2, RESTART, add_key_line, init_line, leaf, receive_line,
+    revoke_key_line,
 };
 
 // ---- The reference model ----
@@ -40,6 +41,7 @@ struct ModelConfig {
     jitter: i128,
     window: i128,
     max_pending: usize,
+    interval: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,6 +64,9 @@ struct Model {
     queues: [VecDeque<(u32, i128, u8)>; 2],
     keys: [BTreeMap<u8, ModelKey>; 2],
     current: [Option<u8>; 2],
+    /// The replay floor in storage, and the one loaded at the last restart.
+    saved: [Option<u64>; 2],
+    loaded: [Option<u64>; 2],
 }
 
 /// A key that is never provisioned for any camera or key id.
@@ -93,6 +98,8 @@ impl Default for Model {
             queues: [VecDeque::new(), VecDeque::new()],
             keys: [initial(0), initial(1)],
             current: [None, None],
+            saved: [None, None],
+            loaded: [None, None],
         }
     }
 }
@@ -133,8 +140,20 @@ impl Model {
         {
             return None;
         }
-        if raw < 0 || !tree_ok {
+        let valid = raw >= 0 && tree_ok;
+        if self.loaded[cam].is_some_and(|floor| u64::from(seq) <= floor) {
+            // Maybe a replay from before the restart: rejected, but a frame
+            // that would otherwise be accepted still moves the camera's key.
+            if valid {
+                self.use_key(cam, key_id);
+            }
             return None;
+        }
+        if !valid {
+            return None;
+        }
+        if self.saved[cam].is_none_or(|floor| u64::from(seq) > floor) {
+            self.saved[cam] = Some(u64::from(seq) + cfg.interval);
         }
         let raw = i128::from(raw);
         let (timestamp, corrected) = match self.last[cam] {
@@ -149,14 +168,7 @@ impl Model {
             }
         };
         self.last[cam] = Some((seq, timestamp));
-        if self.current[cam].is_none_or(|current| key_id > current) {
-            self.current[cam] = Some(key_id);
-            for (_, key) in self.keys[cam].range_mut(..key_id) {
-                if key.status == Status::Active {
-                    key.status = Status::Retired;
-                }
-            }
-        }
+        self.use_key(cam, key_id);
         self.queues[cam].push_back((seq, timestamp, key_id));
 
         let mut records = Vec::new();
@@ -191,6 +203,24 @@ impl Model {
             corrected,
             records,
         })
+    }
+
+    fn use_key(&mut self, cam: usize, key_id: u8) {
+        if self.current[cam].is_none_or(|current| key_id > current) {
+            self.current[cam] = Some(key_id);
+            for (_, key) in self.keys[cam].range_mut(..key_id) {
+                if key.status == Status::Active {
+                    key.status = Status::Retired;
+                }
+            }
+        }
+    }
+
+    /// Power loss: only keys and floors survive.
+    fn restart(&mut self) {
+        self.last = [None, None];
+        self.queues = [VecDeque::new(), VecDeque::new()];
+        self.loaded = self.saved;
     }
 
     /// Q4: `add_key`. Returns whether it succeeds.
@@ -281,6 +311,7 @@ enum Op {
         key_id: u8,
     },
     GetState,
+    Restart,
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -319,11 +350,16 @@ fn op() -> impl Strategy<Value = Op> {
         3 => add_key,
         1 => revoke,
         2 => Just(Op::GetState),
+        1 => Just(Op::Restart),
     ]
 }
 
 fn config() -> impl Strategy<Value = (u64, u64, u64, u64)> {
     (1u64..120).prop_flat_map(|period| (Just(period), 0..period, 0..period, 1u64..7))
+}
+
+fn interval() -> impl Strategy<Value = u64> {
+    prop_oneof![1u64..6, Just(100), Just(4_294_967_295)]
 }
 
 proptest! {
@@ -332,6 +368,7 @@ proptest! {
     #[test]
     fn receiver_matches_the_reference_model(
         (period, jitter, window, max_pending) in config(),
+        interval in interval(),
         start in 0i64..1_000_000,
         ops in prop::collection::vec(op(), 1..80),
     ) {
@@ -340,9 +377,13 @@ proptest! {
             jitter: i128::from(jitter),
             window: i128::from(window),
             max_pending: usize::try_from(max_pending).unwrap(),
+            interval,
         };
         let mut harness = Harness::default();
-        harness.ok(&init_line(period, jitter, window, max_pending));
+        let mut init: Value =
+            serde_json::from_str(&init_line(period, jitter, window, max_pending)).unwrap();
+        init["parameters"]["persist_interval"] = json!(interval);
+        harness.ok(&init.to_string());
         let mut model = Model::default();
         // The last seq and the next "true" camera time each camera generated.
         let mut generated: [(i64, i64); 2] = [(0, start), (0, start + 3)];
@@ -352,6 +393,10 @@ proptest! {
             match op {
                 Op::GetState => {
                     prop_assert_eq!(&before, &model.state());
+                }
+                Op::Restart => {
+                    model.restart();
+                    prop_assert_eq!(&harness.ok(RESTART), &model.state());
                 }
                 Op::AddKey { cam, key_id, alt } => {
                     let hex = key_hex(cam, key_id, alt);
@@ -411,8 +456,13 @@ proptest! {
                     match expected {
                         None => {
                             prop_assert_eq!(&response["status"], "error", "{}", response);
-                            // A rejected frame changes nothing.
-                            prop_assert_eq!(&harness.state(), &before);
+                            // A rejected frame changes nothing, except that one
+                            // rejected only by the restart floor still moves the
+                            // camera's key, as the model does too.
+                            prop_assert_eq!(&harness.state(), &model.state());
+                            if model.loaded[cam].is_none() {
+                                prop_assert_eq!(&harness.state(), &before);
+                            }
                         }
                         Some(outcome) => {
                             prop_assert_eq!(&response["status"], "ok", "{}", response);

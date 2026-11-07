@@ -205,6 +205,7 @@ mod tests {
             max_jitter_ms: 5,
             pair_window_ms: window,
             max_pending,
+            persist_interval: None,
         })
         .unwrap()
     }

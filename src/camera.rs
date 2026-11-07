@@ -63,7 +63,7 @@ impl Serialize for Camera {
 ///
 /// Lookups take a [`Camera`], so they can't go out of bounds. Serializes as
 /// `{"cam1": ..., "cam2": ...}`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct PerCamera<T> {
     cam1: T,
     cam2: T,

@@ -12,8 +12,8 @@ pub const KEY_LEN: usize = 32;
 ///
 /// The bytes are erased when the key is dropped, using the HMAC library's
 /// `zeroize` support (volatile writes the compiler may not remove). The type has
-/// no `Clone`, so the only copy is the one the receiver holds, and its `Debug`
-/// output never shows the bytes.
+/// no `Clone`: the only copies are made by `Key::duplicate`, for storage. Its
+/// `Debug` output never shows the bytes.
 pub struct Key([u8; KEY_LEN]);
 
 impl Key {
@@ -31,6 +31,14 @@ impl Key {
         }
         hex::decode_to_slice(hex, &mut key.0).map_err(|_| KeyError::NotHex)?;
         Ok(key)
+    }
+
+    /// An explicit copy, made only where a key is written to storage or loaded
+    /// back from it (non-volatile storage must hold the keys to survive a
+    /// restart). Each copy erases itself when dropped.
+    #[must_use]
+    pub(crate) const fn duplicate(&self) -> Self {
+        Self(self.0)
     }
 
     /// The key bytes, for computing a tag.
@@ -123,6 +131,15 @@ mod tests {
         );
         let not_hex = format!("{}zz", &HEX[..62]);
         assert_eq!(Key::from_hex(&not_hex).unwrap_err(), KeyError::NotHex);
+    }
+
+    #[test]
+    fn a_duplicate_is_equal_and_separate() {
+        let key = Key::from_hex(HEX).unwrap();
+        let copy = key.duplicate();
+        assert!(copy.ct_eq(&key));
+        drop(key);
+        assert_eq!(copy.as_bytes()[31], 0x1f);
     }
 
     #[test]

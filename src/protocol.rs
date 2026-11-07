@@ -27,6 +27,7 @@ use crate::camera::{Camera, PerCamera};
 use crate::config::{Config, ConfigError, ConfigInput};
 use crate::key::{Key, KeyError, KeyId};
 use crate::receiver::{Accepted, KeyCommandError, ReceiveError, Receiver, State};
+use crate::storage::{MemoryStore, StorageError};
 use crate::sync::SyncRecord;
 use crate::timeline::Millis;
 
@@ -54,10 +55,11 @@ pub fn run<R: BufRead, W: Write>(mut input: R, mut output: W) -> io::Result<()> 
     }
 }
 
-/// The receiver, before and after `init`.
+/// The receiver, before and after `init`. Its storage is simulated in memory;
+/// `restart` rebuilds the receiver from that storage alone.
 #[derive(Debug, Default)]
 pub struct Session {
-    receiver: Option<Receiver>,
+    receiver: Option<Receiver<MemoryStore>>,
 }
 
 impl Session {
@@ -65,7 +67,7 @@ impl Session {
     pub fn handle_line(&mut self, line: &[u8]) -> Response {
         // A panic in planning leaves the state untouched, so carrying on is
         // safe. A panic during a commit is detected by the receiver itself,
-        // which then refuses frames.
+        // which then refuses changes until a restart.
         panic::catch_unwind(AssertUnwindSafe(|| match self.execute(line) {
             Ok(payload) => Response::Ok(payload),
             Err(error) => Response::error(&error),
@@ -104,6 +106,12 @@ impl Session {
                 receiver.revoke_key(camera, key_id)?;
                 Ok(Payload::State(receiver.state()))
             }
+            "restart" => {
+                let NoParams {} = parse(parameters)?;
+                let receiver = self.receiver_mut()?;
+                receiver.restart().map_err(CommandError::Restart)?;
+                Ok(Payload::State(receiver.state()))
+            }
             other => Err(CommandError::UnknownCommand(abbreviate(other))),
         }
     }
@@ -117,23 +125,25 @@ impl Session {
             max_jitter_ms: params.max_jitter_ms,
             pair_window_ms: params.pair_window_ms,
             max_pending: params.max_pending,
+            persist_interval: params.persist_interval,
         })?;
         let keys: KeysParam<'_> = parse(params.keys)?;
         let keys = PerCamera::new(
             decode_key(Camera::Cam1, keys.cam1)?,
             decode_key(Camera::Cam2, keys.cam2)?,
         );
-        let receiver = Receiver::new(config, keys);
+        let receiver =
+            Receiver::new(config, keys, MemoryStore::default()).map_err(CommandError::Init)?;
         let state = receiver.state();
         self.receiver = Some(receiver);
         Ok(Payload::State(state))
     }
 
-    fn receiver(&self) -> Result<&Receiver, CommandError> {
+    fn receiver(&self) -> Result<&Receiver<MemoryStore>, CommandError> {
         self.receiver.as_ref().ok_or(CommandError::NotInitialized)
     }
 
-    fn receiver_mut(&mut self) -> Result<&mut Receiver, CommandError> {
+    fn receiver_mut(&mut self) -> Result<&mut Receiver<MemoryStore>, CommandError> {
         self.receiver.as_mut().ok_or(CommandError::NotInitialized)
     }
 }
@@ -166,6 +176,14 @@ fn parse<'a, T: Deserialize<'a>>(raw: &'a RawValue) -> Result<T, CommandError> {
 }
 
 /// The first 32 characters of attacker-chosen text, for error messages.
+/// Deserializes a field that may be left out but, when present, must hold a
+/// value: `null` is an error rather than a silent default.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
 /// A name from the input, cut short for an error message.
 fn abbreviate(text: &str) -> String {
     truncate(text, 32)
@@ -267,6 +285,9 @@ struct InitParams<'a> {
     max_jitter_ms: u64,
     pair_window_ms: u64,
     max_pending: u64,
+    /// Optional; when present it must be a number (`null` is rejected).
+    #[serde(default, deserialize_with = "present")]
+    persist_interval: Option<u64>,
     /// Kept raw so it can be checked to be an object before it's parsed.
     #[serde(borrow)]
     keys: &'a RawValue,
@@ -420,6 +441,8 @@ enum CommandError {
     KeyIdOutOfRange(u64),
     Receive(ReceiveError),
     KeyCommand(KeyCommandError),
+    Init(StorageError),
+    Restart(StorageError),
     Internal,
 }
 
@@ -470,6 +493,8 @@ impl fmt::Display for CommandError {
             }
             Self::Receive(error) => error.fmt(f),
             Self::KeyCommand(error) => error.fmt(f),
+            Self::Init(error) => write!(f, "{error}: not initialized"),
+            Self::Restart(error) => write!(f, "{error}: restart failed"),
             Self::Internal => f.write_str("internal error"),
         }
     }

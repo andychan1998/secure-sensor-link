@@ -1,0 +1,92 @@
+# The follow-on 2 (restarts) example, which continues from the follow-on 1
+# example (persist_interval is the default, 100). The base part is matched
+# partially; the rest exactly.
+
+> {"command":"init","parameters":{"period_ms":50,"max_jitter_ms":5,"pair_window_ms":20,"max_pending":4,"keys":{"cam1":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","cam2":"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"}}}
+<~ {"status":"ok","payload":{"cameras":{"cam1":{"last_seq":null,"last_timestamp":null,"pending":[]},"cam2":{"last_seq":null,"last_timestamp":null,"pending":[]}}}}
+
+# cam1 frame 1 has nothing to pair with yet
+> {"command":"receive","parameters":{"frame":"01010000000100000000000003e8001f01000000010100000002000001000000030100000004000001000000050000fe04b3dcfd1aa96276d46024a02a89e9125a556fa6a3e1b14628fb7cd4375d82"}}
+<~ {"status":"ok","payload":{"frame":{"camera":"cam1","seq":1,"timestamp":1000,"corrected":false,"tree":[1,2,3,null,null,4,5]},"synced":[]}}
+
+# cam2 frame 1 is 5 ms from cam1 frame 1, so they pair
+> {"command":"receive","parameters":{"frame":"01020000000100000000000003ed00010096af248e74798001df0e27b21440c4b3bf99400f3ea51076772b84dea76ebcc2"}}
+<~ {"status":"ok","payload":{"frame":{"camera":"cam2","seq":1,"timestamp":1005,"corrected":false,"tree":[]},"synced":[{"timestamp":1002,"cam1":1,"cam2":1}]}}
+
+> {"command":"receive","parameters":{"frame":"010100000002000000000000041a00070100000007000047226ed30dce17bcdb78c70f9a33b7875989dd9d2cf0688aaa1571d67894952e"}}
+<~ {"status":"ok","payload":{"frame":{"camera":"cam1","seq":2,"timestamp":1050,"corrected":false,"tree":[7]},"synced":[]}}
+
+# cam2's clock glitches; the expected timestamp is 1005 + (2 - 1) * 50 = 1055
+> {"command":"receive","parameters":{"frame":"010200000002000000000000270f00010043ea6799c35ce2f2d880d1dedb447b3991421e377042817b2b4990e0086b2a16"}}
+<~ {"status":"ok","payload":{"frame":{"camera":"cam2","seq":2,"timestamp":1055,"corrected":true,"tree":[]},"synced":[{"timestamp":1052,"cam1":2,"cam2":2}]}}
+
+# an attacker replays cam1 frame 2
+> {"command":"receive","parameters":{"frame":"010100000002000000000000041a00070100000007000047226ed30dce17bcdb78c70f9a33b7875989dd9d2cf0688aaa1571d67894952e"}}
+< {"status":"error","payload":{"message":"stale or replayed frame: cam1 seq 2"}}
+
+# an attacker modifies cam1 frame 3 in transit
+> {"command":"receive","parameters":{"frame":"010100000003000000000000044c0007010000000900002b39f86aa23ba25e8a87aa903f5f2195cb24bc9a3a1201f61ef4c338cc7cc7a5"}}
+< {"status":"error","payload":{"message":"authentication failed for cam1"}}
+
+# frame 3 never arrived intact; the expected timestamp is 1050 + (4 - 2) * 50 = 1150
+> {"command":"receive","parameters":{"frame":"010100000004000000000000047e000701fffffffd00004d518005ad8fab624fb8aefac19427b3b9341921f271fc2184a4307a13bcc642"}}
+<~ {"status":"ok","payload":{"frame":{"camera":"cam1","seq":4,"timestamp":1150,"corrected":false,"tree":[-3]},"synced":[]}}
+
+# cam2 frame 3 is 46 ms older than cam1 frame 4 and can never be paired
+> {"command":"receive","parameters":{"frame":"01020000000300000000000004500001007e22b41e0cd076dab0f46feaec39212d5f2f6a440acd491056a930e743d0e489"}}
+<~ {"status":"ok","payload":{"frame":{"camera":"cam2","seq":3,"timestamp":1104,"corrected":false,"tree":[]},"synced":[{"timestamp":1104,"cam1":null,"cam2":3}]}}
+
+> {"command":"receive","parameters":{"frame":"0102000000040000000000000483000100bd5389a3c387313add87919347a30d8543c5f222b41b8e008f714e153798c74f"}}
+<~ {"status":"ok","payload":{"frame":{"camera":"cam2","seq":4,"timestamp":1155,"corrected":false,"tree":[]},"synced":[{"timestamp":1152,"cam1":4,"cam2":4}]}}
+
+> {"command":"get_state","parameters":{}}
+<~ {"status":"ok","payload":{"cameras":{"cam1":{"last_seq":4,"last_timestamp":1150,"pending":[]},"cam2":{"last_seq":4,"last_timestamp":1155,"pending":[]}}}}
+
+# ---- Follow-on 1 ----
+
+# the key-management service provisions key 1 for cam1
+> {"command":"add_key","parameters":{"camera":"cam1","key_id":1,"key":"404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"}}
+< {"status":"ok","payload":{"cameras":{"cam1":{"last_seq":4,"last_timestamp":1150,"pending":[],"keys":[{"key_id":0,"status":"active"},{"key_id":1,"status":"active"}]},"cam2":{"last_seq":4,"last_timestamp":1155,"pending":[],"keys":[{"key_id":0,"status":"active"}]}}}}
+
+# cam1 moves to key 1, so cam1 key 0 is now retired
+> {"command":"receive","parameters":{"frame":"0201010000000500000000000004b0000701000000050000bf5420c0cf3ae90a54057c6bbde21814ff9d4763edb475d13d0009d7880841e1"}}
+< {"status":"ok","payload":{"frame":{"camera":"cam1","key_id":1,"seq":5,"timestamp":1200,"corrected":false,"tree":[5]},"synced":[]}}
+
+# an attacker holding cam1's old key forges a version 1 frame
+> {"command":"receive","parameters":{"frame":"01010000000600000000000004e2000100b3d3c425d7a80049a33abd62afacef967db1b1ce7bdd5c470e6f4fcf543f5efb"}}
+< {"status":"error","payload":{"message":"cam1 key 0 is retired"}}
+
+# cam2 key 0 is suspected compromised
+> {"command":"revoke_key","parameters":{"camera":"cam2","key_id":0}}
+< {"status":"ok","payload":{"cameras":{"cam1":{"last_seq":5,"last_timestamp":1200,"pending":[5],"keys":[{"key_id":0,"status":"retired"},{"key_id":1,"status":"active"}]},"cam2":{"last_seq":4,"last_timestamp":1155,"pending":[],"keys":[{"key_id":0,"status":"revoked"}]}}}}
+
+# cam2 has not been re-keyed yet, so its frame 5 is lost
+> {"command":"receive","parameters":{"frame":"01020000000500000000000004b5000100c1c50337c32b06a5ca34fddc6a16bfbeee9dac003ade88881056043eefbaba5b"}}
+< {"status":"error","payload":{"message":"cam2 key 0 is revoked"}}
+
+> {"command":"add_key","parameters":{"camera":"cam2","key_id":1,"key":"606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"}}
+< {"status":"ok","payload":{"cameras":{"cam1":{"last_seq":5,"last_timestamp":1200,"pending":[5],"keys":[{"key_id":0,"status":"retired"},{"key_id":1,"status":"active"}]},"cam2":{"last_seq":4,"last_timestamp":1155,"pending":[],"keys":[{"key_id":0,"status":"revoked"},{"key_id":1,"status":"active"}]}}}}
+
+# with cam2 frame 5 lost, cam1 frame 5 can no longer be paired
+> {"command":"receive","parameters":{"frame":"0202010000000600000000000004e700010076e5e87ea20b65179c6ca47b069c2a258379bc96f7afe7bd8efaeafbbc55fb9c"}}
+< {"status":"ok","payload":{"frame":{"camera":"cam2","key_id":1,"seq":6,"timestamp":1255,"corrected":false,"tree":[]},"synced":[{"timestamp":1200,"cam1":5,"cam2":null}]}}
+
+> {"command":"receive","parameters":{"frame":"0201010000000600000000000004e2000701000000090000d10e3a15c5f214ef88be2a3b6fe0de2fbb175b647a3794fdaebe03b1a76421a8"}}
+< {"status":"ok","payload":{"frame":{"camera":"cam1","key_id":1,"seq":6,"timestamp":1250,"corrected":false,"tree":[9]},"synced":[{"timestamp":1252,"cam1":6,"cam2":6}]}}
+
+> {"command":"get_state","parameters":{}}
+< {"status":"ok","payload":{"cameras":{"cam1":{"last_seq":6,"last_timestamp":1250,"pending":[],"keys":[{"key_id":0,"status":"retired"},{"key_id":1,"status":"active"}]},"cam2":{"last_seq":6,"last_timestamp":1255,"pending":[],"keys":[{"key_id":0,"status":"revoked"},{"key_id":1,"status":"active"}]}}}}
+
+# power loss: the fusion node reboots
+> {"command":"restart","parameters":{}}
+< {"status":"ok","payload":{"cameras":{"cam1":{"last_seq":null,"last_timestamp":null,"pending":[],"keys":[{"key_id":0,"status":"retired"},{"key_id":1,"status":"active"}]},"cam2":{"last_seq":null,"last_timestamp":null,"pending":[],"keys":[{"key_id":0,"status":"revoked"},{"key_id":1,"status":"active"}]}}}}
+
+# an attacker replays a frame recorded before the reboot
+> {"command":"receive","parameters":{"frame":"0201010000000600000000000004e2000701000000090000d10e3a15c5f214ef88be2a3b6fe0de2fbb175b647a3794fdaebe03b1a76421a8"}}
+< {"status":"error","payload":{"message":"stale or replayed frame: cam1 seq 6"}}
+
+# seq 107 is more than persist_interval (100) past seq 6, so it must be accepted; the timeline starts over
+> {"command":"receive","parameters":{"frame":"0201010000006b000000000000189c000100d089a770f275841599d82ae9f2faa5219d396f2c834f6fc6e993b634c01ea0ff"}}
+< {"status":"ok","payload":{"frame":{"camera":"cam1","key_id":1,"seq":107,"timestamp":6300,"corrected":false,"tree":[]},"synced":[]}}
+> {"command":"receive","parameters":{"frame":"0202010000006b00000000000018a10001009aaf101636fa22120bcd29248ce71df833c45c3670bcffca1b3199cbc47a514a"}}
+< {"status":"ok","payload":{"frame":{"camera":"cam2","key_id":1,"seq":107,"timestamp":6305,"corrected":false,"tree":[]},"synced":[{"timestamp":6302,"cam1":107,"cam2":107}]}}

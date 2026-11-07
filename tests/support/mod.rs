@@ -131,6 +131,15 @@ pub fn init_line(period: u64, jitter: u64, window: u64, max_pending: u64) -> Str
     .to_string()
 }
 
+/// `init` with the spec's example timing and the given `persist_interval`.
+pub fn init_line_with_interval(persist_interval: u64) -> String {
+    let mut line: Value = serde_json::from_str(&init_line(50, 5, 20, 4)).unwrap();
+    line["parameters"]["persist_interval"] = json!(persist_interval);
+    line.to_string()
+}
+
+pub const RESTART: &str = r#"{"command":"restart","parameters":{}}"#;
+
 pub fn receive_line(frame_hex: &str) -> String {
     json!({"command": "receive", "parameters": {"frame": frame_hex}}).to_string()
 }

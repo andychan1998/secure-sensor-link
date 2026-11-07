@@ -6,6 +6,8 @@ use std::fmt;
 pub const MAX_PERIOD_MS: u64 = 60_000;
 /// Largest allowed `max_pending`.
 pub const MAX_PENDING_LIMIT: u64 = 1_024;
+/// `persist_interval` when `init` doesn't give one.
+pub const DEFAULT_PERSIST_INTERVAL: u32 = 100;
 
 /// Validated configuration. Only [`Config::new`] can build one, so every
 /// `Config` in the program satisfies the spec's ranges.
@@ -15,6 +17,7 @@ pub struct Config {
     max_jitter_ms: u32,
     pair_window_ms: u32,
     max_pending: usize,
+    persist_interval: u32,
 }
 
 /// The raw numbers from an `init` command, before validation.
@@ -24,6 +27,8 @@ pub struct ConfigInput {
     pub max_jitter_ms: u64,
     pub pair_window_ms: u64,
     pub max_pending: u64,
+    /// `None` when `init` leaves it out.
+    pub persist_interval: Option<u64>,
 }
 
 impl Config {
@@ -39,11 +44,16 @@ impl Config {
         let max_jitter_ms = in_range("max_jitter_ms", input.max_jitter_ms, 0, below_period)?;
         let pair_window_ms = in_range("pair_window_ms", input.pair_window_ms, 0, below_period)?;
         let max_pending = in_range("max_pending", input.max_pending, 1, MAX_PENDING_LIMIT)?;
+        let persist_interval = match input.persist_interval {
+            None => DEFAULT_PERSIST_INTERVAL,
+            Some(value) => narrow(in_range("persist_interval", value, 1, u64::from(u32::MAX))?)?,
+        };
         Ok(Self {
             period_ms: narrow(period_ms)?,
             max_jitter_ms: narrow(max_jitter_ms)?,
             pair_window_ms: narrow(pair_window_ms)?,
             max_pending: usize::try_from(max_pending).map_err(|_| ConfigError::Internal)?,
+            persist_interval,
         })
     }
 
@@ -66,6 +76,12 @@ impl Config {
     pub const fn max_pending(&self) -> usize {
         self.max_pending
     }
+
+    /// How far above an accepted seq the saved replay floor is set.
+    #[must_use]
+    pub const fn persist_interval(&self) -> u32 {
+        self.persist_interval
+    }
 }
 
 fn in_range(name: &'static str, value: u64, min: u64, max: u64) -> Result<u64, ConfigError> {
@@ -81,7 +97,7 @@ fn in_range(name: &'static str, value: u64, min: u64, max: u64) -> Result<u64, C
     }
 }
 
-/// Narrows a value already known to be at most 60,000.
+/// Narrows a value already range-checked to fit in a `u32`.
 fn narrow(value: u64) -> Result<u32, ConfigError> {
     u32::try_from(value).map_err(|_| ConfigError::Internal)
 }
@@ -125,7 +141,40 @@ mod tests {
             max_jitter_ms: jitter,
             pair_window_ms: window,
             max_pending: pending,
+            persist_interval: None,
         }
+    }
+
+    fn with_interval(interval: u64) -> ConfigInput {
+        ConfigInput {
+            persist_interval: Some(interval),
+            ..input(50, 5, 20, 4)
+        }
+    }
+
+    #[test]
+    fn persist_interval_defaults_to_100_and_covers_every_u32() {
+        assert_eq!(
+            Config::new(input(50, 5, 20, 4)).unwrap().persist_interval(),
+            100
+        );
+        assert_eq!(Config::new(with_interval(1)).unwrap().persist_interval(), 1);
+        assert_eq!(
+            Config::new(with_interval(4_294_967_295))
+                .unwrap()
+                .persist_interval(),
+            u32::MAX
+        );
+        assert_eq!(
+            Config::new(with_interval(0)).unwrap_err().to_string(),
+            "persist_interval must be from 1 to 4294967295, got 0"
+        );
+        assert_eq!(
+            Config::new(with_interval(4_294_967_296))
+                .unwrap_err()
+                .to_string(),
+            "persist_interval must be from 1 to 4294967295, got 4294967296"
+        );
     }
 
     #[test]
