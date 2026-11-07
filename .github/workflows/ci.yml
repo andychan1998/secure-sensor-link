@@ -44,6 +44,28 @@ jobs:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --locked --summary-only
 
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [command_line, receiver, tree]
+    steps:
+      - uses: actions/checkout@v6
+      # cargo-fuzz needs nightly; the receiver itself stays on the pinned toolchain.
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # A short run on every push; longer runs belong on a laptop or a schedule.
+      - run: fuzz/run.sh ${{ matrix.target }} 60
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failure-${{ matrix.target }}
+          path: fuzz/artifacts
+
   dependencies:
     runs-on: ubuntu-latest
     steps:
