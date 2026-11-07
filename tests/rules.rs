@@ -78,11 +78,11 @@ fn a_negative_timestamp_is_malformed() {
 #[test]
 fn layout_errors_name_the_problem() {
     let mut h = Harness::spec_config();
-    let mut version_2 = Frame::new(1, 1, 1000);
-    version_2.version = 2;
+    let mut version_3 = Frame::new(1, 1, 1000);
+    version_3.version = 3;
     assert_eq!(
-        reject(&mut h, &version_2),
-        "malformed frame: unsupported version 2"
+        reject(&mut h, &version_3),
+        "malformed frame: unsupported version 3"
     );
     let mut camera_3 = Frame::new(1, 1, 1000);
     camera_3.camera = 3;

@@ -10,6 +10,9 @@
 //!
 //! [`RawFrame::verify`] is the only way to get a `VerifiedFrame`, so reading a
 //! seq before the tag is checked doesn't compile.
+//!
+//! Version 1 frames carry no key id and use key 0. Version 2 frames add a
+//! one-byte key id after the camera byte.
 
 use std::fmt;
 
@@ -17,16 +20,18 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::camera::Camera;
-use crate::key::Key;
+use crate::key::{Key, KeyId};
 
 /// Length of the HMAC-SHA256 tag.
 pub const TAG_LEN: usize = 32;
 /// Length of a version 1 header: version, camera, seq, timestamp, `payload_len`.
 pub const V1_HEADER_LEN: usize = 16;
-/// The version this receiver accepts.
+/// Length of a version 2 header: version 1's plus a key id.
+pub const V2_HEADER_LEN: usize = 17;
 pub const VERSION_1: u8 = 0x01;
+pub const VERSION_2: u8 = 0x02;
 /// Largest possible frame: the longest header plus the largest payload and tag.
-pub const MAX_FRAME_LEN: usize = 17 + 65_535 + TAG_LEN;
+pub const MAX_FRAME_LEN: usize = V2_HEADER_LEN + 65_535 + TAG_LEN;
 /// Largest possible frame in hex characters.
 pub const MAX_FRAME_HEX_LEN: usize = 2 * MAX_FRAME_LEN;
 
@@ -55,6 +60,7 @@ pub fn decode_hex(hex: &str) -> Result<Vec<u8>, FrameError> {
 #[derive(Debug)]
 pub struct RawFrame<'a> {
     camera: Camera,
+    key_id: KeyId,
     /// Header and payload: the bytes the tag covers.
     signed: &'a [u8],
     tag: &'a [u8; TAG_LEN],
@@ -75,10 +81,12 @@ impl<'a> RawFrame<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, FrameError> {
         let len = bytes.len();
         let (&version, _) = bytes.split_first().ok_or(FrameError::Empty)?;
-        if version != VERSION_1 {
-            return Err(FrameError::UnsupportedVersion(version));
-        }
-        let min_len = V1_HEADER_LEN.saturating_add(TAG_LEN);
+        let header_len = match version {
+            VERSION_1 => V1_HEADER_LEN,
+            VERSION_2 => V2_HEADER_LEN,
+            other => return Err(FrameError::UnsupportedVersion(other)),
+        };
+        let min_len = header_len.saturating_add(TAG_LEN);
         if len < min_len {
             return Err(FrameError::TooShort { len, min: min_len });
         }
@@ -91,6 +99,11 @@ impl<'a> RawFrame<'a> {
         let camera_byte = header.u8()?;
         let camera =
             Camera::from_wire(camera_byte).ok_or(FrameError::UnknownCamera(camera_byte))?;
+        let key_id = if version == VERSION_2 {
+            KeyId(header.u8()?)
+        } else {
+            KeyId::INITIAL
+        };
         let seq = header.u32()?;
         let timestamp = header.i64()?;
         let payload_len = header.u16()?;
@@ -106,6 +119,7 @@ impl<'a> RawFrame<'a> {
         }
         Ok(Self {
             camera,
+            key_id,
             signed,
             tag,
             seq,
@@ -118,6 +132,13 @@ impl<'a> RawFrame<'a> {
     #[must_use]
     pub const fn camera(&self) -> Camera {
         self.camera
+    }
+
+    /// The key the frame claims to use (key 0 for version 1). Used only to pick
+    /// the key.
+    #[must_use]
+    pub const fn key_id(&self) -> KeyId {
+        self.key_id
     }
 
     /// Checks the tag against `key`, in constant time.
@@ -134,6 +155,7 @@ impl<'a> RawFrame<'a> {
             .map_err(|_| FrameError::AuthenticationFailed(self.camera))?;
         Ok(VerifiedFrame {
             camera: self.camera,
+            key_id: self.key_id,
             seq: self.seq,
             timestamp: self.timestamp,
             payload: self.payload,
@@ -145,6 +167,7 @@ impl<'a> RawFrame<'a> {
 #[derive(Debug)]
 pub struct VerifiedFrame<'a> {
     camera: Camera,
+    key_id: KeyId,
     seq: u32,
     timestamp: i64,
     payload: &'a [u8],
@@ -154,6 +177,11 @@ impl<'a> VerifiedFrame<'a> {
     #[must_use]
     pub const fn camera(&self) -> Camera {
         self.camera
+    }
+
+    #[must_use]
+    pub const fn key_id(&self) -> KeyId {
+        self.key_id
     }
 
     #[must_use]
@@ -355,12 +383,20 @@ mod tests {
     fn layout_checks_in_order() {
         assert_eq!(RawFrame::parse(&[]).unwrap_err(), FrameError::Empty);
         assert_eq!(
-            RawFrame::parse(&[0x02; 60]).unwrap_err(),
-            FrameError::UnsupportedVersion(2)
+            RawFrame::parse(&[0x03; 60]).unwrap_err(),
+            FrameError::UnsupportedVersion(3)
+        );
+        assert_eq!(
+            RawFrame::parse(&[0x00; 60]).unwrap_err(),
+            FrameError::UnsupportedVersion(0)
         );
         assert_eq!(
             RawFrame::parse(&[0x01; 47]).unwrap_err(),
             FrameError::TooShort { len: 47, min: 48 }
+        );
+        assert_eq!(
+            RawFrame::parse(&[0x02; 48]).unwrap_err(),
+            FrameError::TooShort { len: 48, min: 49 }
         );
         let mut unknown_camera = vec![0u8; 49];
         unknown_camera[0] = 0x01;
@@ -368,6 +404,50 @@ mod tests {
         assert_eq!(
             RawFrame::parse(&unknown_camera).unwrap_err(),
             FrameError::UnknownCamera(3)
+        );
+    }
+
+    /// The spec's follow-on 1 example: cam1, key 1, seq 5, timestamp 1200, tree [5].
+    const SPEC_V2_FRAME: &str = "0201010000000500000000000004b0000701000000050000bf5420c0cf3ae90a\
+                                 54057c6bbde21814ff9d4763edb475d13d0009d7880841e1";
+    const KEY1_ID1: &str = "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f";
+
+    #[test]
+    fn verifies_a_version_2_frame_and_reads_its_key_id() {
+        let bytes = decode_hex(SPEC_V2_FRAME).unwrap();
+        let raw = RawFrame::parse(&bytes).unwrap();
+        assert_eq!(raw.camera(), Camera::Cam1);
+        assert_eq!(raw.key_id(), KeyId(1));
+        let frame = raw.verify(&Key::from_hex(KEY1_ID1).unwrap()).unwrap();
+        assert_eq!(frame.key_id(), KeyId(1));
+        assert_eq!(frame.seq(), 5);
+        assert_eq!(frame.timestamp(), 1200);
+        assert_eq!(frame.payload(), &[1, 0, 0, 0, 5, 0, 0]);
+        // The key id is covered by the tag.
+        let mut changed = bytes.clone();
+        changed[2] = 0;
+        let raw = RawFrame::parse(&changed).unwrap();
+        assert_eq!(raw.key_id(), KeyId(0));
+        assert!(raw.verify(&Key::from_hex(KEY1_ID1).unwrap()).is_err());
+    }
+
+    #[test]
+    fn version_1_frames_use_key_zero() {
+        let bytes = decode_hex(SPEC_FRAME).unwrap();
+        let raw = RawFrame::parse(&bytes).unwrap();
+        assert_eq!(raw.key_id(), KeyId(0));
+        assert_eq!(raw.verify(&key1()).unwrap().key_id(), KeyId(0));
+    }
+
+    #[test]
+    fn version_2_length_mismatch_counts_the_longer_header() {
+        let mut bytes = vec![0u8; 49];
+        bytes[0] = 0x02;
+        bytes[1] = 0x01;
+        bytes[16] = 1;
+        assert_eq!(
+            RawFrame::parse(&bytes).unwrap_err().to_string(),
+            "malformed frame: payload_len 1 implies a 50-byte frame, got 49 bytes"
         );
     }
 

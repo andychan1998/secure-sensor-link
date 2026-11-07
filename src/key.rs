@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use ctutils::CtEq;
 use hmac::digest::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Length of a camera key in bytes.
@@ -35,6 +36,30 @@ impl Key {
     /// The key bytes, for computing a tag.
     pub(crate) const fn as_bytes(&self) -> &[u8; KEY_LEN] {
         &self.0
+    }
+
+    /// Whether two keys are the same, in time that doesn't depend on where
+    /// they differ, so timing can't reveal a stored key byte by byte.
+    #[must_use]
+    pub fn ct_eq(&self, other: &Self) -> bool {
+        self.0.ct_eq(&other.0).to_bool()
+    }
+}
+
+/// A key's number within its camera, from 0 to 255. Keys given to `init` are
+/// key 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(transparent)]
+pub struct KeyId(pub u8);
+
+impl KeyId {
+    /// The key used by version 1 frames and set up by `init`.
+    pub const INITIAL: Self = Self(0);
+}
+
+impl fmt::Display for KeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -98,6 +123,18 @@ mod tests {
         );
         let not_hex = format!("{}zz", &HEX[..62]);
         assert_eq!(Key::from_hex(&not_hex).unwrap_err(), KeyError::NotHex);
+    }
+
+    #[test]
+    fn constant_time_equality() {
+        let a = Key::from_hex(HEX).unwrap();
+        let b = Key::from_hex(HEX).unwrap();
+        assert!(a.ct_eq(&b));
+        // A difference in the first or the last byte is found either way.
+        let first = Key::from_hex(&format!("01{}", &HEX[2..])).unwrap();
+        let last = Key::from_hex(&format!("{}1e", &HEX[..62])).unwrap();
+        assert!(!a.ct_eq(&first));
+        assert!(!a.ct_eq(&last));
     }
 
     #[test]

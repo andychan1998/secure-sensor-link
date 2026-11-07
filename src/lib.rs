@@ -7,7 +7,7 @@
 //!
 //! 1. hex, then 2. version, then 3. layout (camera, exact length) — the only
 //!    reads before the tag, just enough to pick the key and find the tag;
-//! 4. key status (with key rotation);
+//! 4. key status: provisioned, not revoked, not retired;
 //! 5. the HMAC-SHA256 tag, compared in constant time;
 //! 6. replay (seq above the last accepted);
 //! 7. timestamp not negative;
@@ -30,6 +30,7 @@ pub mod camera;
 pub mod config;
 pub mod frame;
 pub mod key;
+pub mod keyring;
 pub mod protocol;
 pub mod receiver;
 pub mod sync;

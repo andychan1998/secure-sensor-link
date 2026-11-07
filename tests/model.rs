@@ -1,7 +1,7 @@
 //! Random tests against a reference model.
 //!
 //! The model below is a deliberately plain, separate implementation of the
-//! spec's rules (replay, timestamp correction, pairing) with none of the
+//! spec's rules (keys, replay, timestamp correction, pairing) with none of the
 //! receiver's structure. Random command sequences go to both, and after every
 //! command the response and the full state must agree. Along the way this
 //! checks that a rejected frame changes nothing, queues never exceed
@@ -24,11 +24,13 @@
 
 mod support;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use proptest::prelude::*;
 use serde_json::{Value, json};
-use support::{Frame, Harness, init_line, leaf, receive_line};
+use support::{
+    Frame, Harness, KEY1, KEY2, add_key_line, init_line, leaf, receive_line, revoke_key_line,
+};
 
 // ---- The reference model ----
 
@@ -40,10 +42,59 @@ struct ModelConfig {
     max_pending: usize,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Status {
+    Active,
+    Retired,
+    Revoked,
+}
+
+#[derive(Clone, Debug)]
+struct ModelKey {
+    hex: String,
+    status: Status,
+}
+
+#[derive(Clone, Debug)]
 struct Model {
     last: [Option<(u32, i128)>; 2],
-    queues: [VecDeque<(u32, i128)>; 2],
+    /// Waiting frames: seq, corrected timestamp, key id.
+    queues: [VecDeque<(u32, i128, u8)>; 2],
+    keys: [BTreeMap<u8, ModelKey>; 2],
+    current: [Option<u8>; 2],
+}
+
+/// A key that is never provisioned for any camera or key id.
+const WRONG_KEY: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+/// The key the tests provision for `cam` (0 or 1) under `id`; `alt` gives a
+/// different key for the same id.
+fn key_hex(cam: usize, id: u8, alt: bool) -> String {
+    if id == 0 && !alt {
+        return if cam == 0 { KEY1 } else { KEY2 }.to_owned();
+    }
+    let byte = u8::try_from(cam).unwrap() * 64 + id * 2 + u8::from(alt) + 1;
+    format!("{byte:02x}").repeat(32)
+}
+
+impl Default for Model {
+    fn default() -> Self {
+        let initial = |cam| {
+            BTreeMap::from([(
+                0,
+                ModelKey {
+                    hex: key_hex(cam, 0, false),
+                    status: Status::Active,
+                },
+            )])
+        };
+        Self {
+            last: [None, None],
+            queues: [VecDeque::new(), VecDeque::new()],
+            keys: [initial(0), initial(1)],
+            current: [None, None],
+        }
+    }
 }
 
 /// What the model expects a frame to produce.
@@ -56,15 +107,24 @@ struct Outcome {
 
 impl Model {
     /// The spec's rules, written as directly as possible. `cam` is 0 or 1.
+    #[allow(clippy::too_many_arguments)]
     fn receive(
         &mut self,
         cfg: &ModelConfig,
         cam: usize,
+        key_id: u8,
         seq: u32,
         raw: i64,
         tag_ok: bool,
         tree_ok: bool,
     ) -> Option<Outcome> {
+        match self.keys[cam].get(&key_id) {
+            Some(ModelKey {
+                status: Status::Active,
+                ..
+            }) => {}
+            _ => return None,
+        }
         if !tag_ok {
             return None;
         }
@@ -89,13 +149,21 @@ impl Model {
             }
         };
         self.last[cam] = Some((seq, timestamp));
-        self.queues[cam].push_back((seq, timestamp));
+        if self.current[cam].is_none_or(|current| key_id > current) {
+            self.current[cam] = Some(key_id);
+            for (_, key) in self.keys[cam].range_mut(..key_id) {
+                if key.status == Status::Active {
+                    key.status = Status::Retired;
+                }
+            }
+        }
+        self.queues[cam].push_back((seq, timestamp, key_id));
 
         let mut records = Vec::new();
         let record = |ts: i128, c1: Option<u32>, c2: Option<u32>| json!({"timestamp": ts, "cam1": c1, "cam2": c2});
         while !self.queues[0].is_empty() && !self.queues[1].is_empty() {
-            let (s1, t1) = self.queues[0][0];
-            let (s2, t2) = self.queues[1][0];
+            let (s1, t1, _) = self.queues[0][0];
+            let (s2, t2, _) = self.queues[1][0];
             if (t1 - t2).abs() <= cfg.window {
                 self.queues[0].pop_front();
                 self.queues[1].pop_front();
@@ -110,7 +178,7 @@ impl Model {
         }
         for c in 0..2 {
             if self.queues[c].len() > cfg.max_pending {
-                let (s, t) = self.queues[c].pop_front().unwrap();
+                let (s, t, _) = self.queues[c].pop_front().unwrap();
                 records.push(if c == 0 {
                     record(t, Some(s), None)
                 } else {
@@ -125,12 +193,52 @@ impl Model {
         })
     }
 
+    /// Q4: `add_key`. Returns whether it succeeds.
+    fn add_key(&mut self, cam: usize, id: u8, hex: &str) -> bool {
+        if let Some(key) = self.keys[cam].get(&id) {
+            return key.status == Status::Active && key.hex == hex;
+        }
+        if self.current[cam].is_some_and(|current| id < current) {
+            return false;
+        }
+        self.keys[cam].insert(
+            id,
+            ModelKey {
+                hex: hex.to_owned(),
+                status: Status::Active,
+            },
+        );
+        true
+    }
+
+    /// `revoke_key`, with Q5: queued frames that used the key are dropped.
+    fn revoke_key(&mut self, cam: usize, id: u8) -> bool {
+        let Some(key) = self.keys[cam].get_mut(&id) else {
+            return false;
+        };
+        key.status = Status::Revoked;
+        self.queues[cam].retain(|(_, _, k)| *k != id);
+        true
+    }
+
     fn state(&self) -> Value {
         let camera = |c: usize| {
+            let keys: Vec<Value> = self.keys[c]
+                .iter()
+                .map(|(id, key)| {
+                    let status = match key.status {
+                        Status::Active => "active",
+                        Status::Retired => "retired",
+                        Status::Revoked => "revoked",
+                    };
+                    json!({"key_id": id, "status": status})
+                })
+                .collect();
             json!({
                 "last_seq": self.last[c].map(|(s, _)| s),
                 "last_timestamp": self.last[c].map(|(_, t)| t),
-                "pending": self.queues[c].iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                "pending": self.queues[c].iter().map(|(s, _, _)| *s).collect::<Vec<_>>(),
+                "keys": keys,
             })
         };
         json!({"cameras": {"cam1": camera(0), "cam2": camera(1)}})
@@ -152,6 +260,9 @@ enum Kind {
 enum Op {
     Frame {
         cam: usize,
+        key_id: u8,
+        /// For key 0: send it as a version 1 frame.
+        version_1: bool,
         /// Seq relative to the camera's last generated seq: may repeat or go back.
         seq_step: i64,
         /// Timestamp relative to the expected one.
@@ -159,6 +270,15 @@ enum Op {
         glitch: bool,
         kind: Kind,
         value: i32,
+    },
+    AddKey {
+        cam: usize,
+        key_id: u8,
+        alt: bool,
+    },
+    Revoke {
+        cam: usize,
+        key_id: u8,
     },
     GetState,
 }
@@ -172,22 +292,34 @@ fn op() -> impl Strategy<Value = Op> {
         1 => Just(Kind::NegativeTimestamp),
     ];
     let frame = (
-        0usize..2,
+        (0usize..2, 0u8..4, any::<bool>()),
         -2i64..5,
         -8i64..9,
         prop::bool::weighted(0.1),
         kind,
         any::<i32>(),
     )
-        .prop_map(|(cam, seq_step, offset, glitch, kind, value)| Op::Frame {
-            cam,
-            seq_step,
-            offset,
-            glitch,
-            kind,
-            value,
-        });
-    prop_oneof![9 => frame, 1 => Just(Op::GetState)]
+        .prop_map(
+            |((cam, key_id, version_1), seq_step, offset, glitch, kind, value)| Op::Frame {
+                cam,
+                key_id,
+                version_1,
+                seq_step,
+                offset,
+                glitch,
+                kind,
+                value,
+            },
+        );
+    let add_key = (0usize..2, 0u8..4, prop::bool::weighted(0.2))
+        .prop_map(|(cam, key_id, alt)| Op::AddKey { cam, key_id, alt });
+    let revoke = (0usize..2, 0u8..4).prop_map(|(cam, key_id)| Op::Revoke { cam, key_id });
+    prop_oneof![
+        30 => frame,
+        3 => add_key,
+        1 => revoke,
+        2 => Just(Op::GetState),
+    ]
 }
 
 fn config() -> impl Strategy<Value = (u64, u64, u64, u64)> {
@@ -221,7 +353,22 @@ proptest! {
                 Op::GetState => {
                     prop_assert_eq!(&before, &model.state());
                 }
-                Op::Frame { cam, seq_step, offset, glitch, kind, value } => {
+                Op::AddKey { cam, key_id, alt } => {
+                    let hex = key_hex(cam, key_id, alt);
+                    let name = if cam == 0 { "cam1" } else { "cam2" };
+                    let response = harness.send(&add_key_line(name, u64::from(key_id), &hex));
+                    let expected = if model.add_key(cam, key_id, &hex) { "ok" } else { "error" };
+                    prop_assert_eq!(&response["status"], expected, "{}", response);
+                    prop_assert_eq!(&harness.state(), &model.state());
+                }
+                Op::Revoke { cam, key_id } => {
+                    let name = if cam == 0 { "cam1" } else { "cam2" };
+                    let response = harness.send(&revoke_key_line(name, u64::from(key_id)));
+                    let expected = if model.revoke_key(cam, key_id) { "ok" } else { "error" };
+                    prop_assert_eq!(&response["status"], expected, "{}", response);
+                    prop_assert_eq!(&harness.state(), &model.state());
+                }
+                Op::Frame { cam, key_id, version_1, seq_step, offset, glitch, kind, value } => {
                     let (last_seq, clock) = generated[cam];
                     let seq = u32::try_from((last_seq + seq_step).clamp(0, i64::from(u32::MAX))).unwrap();
                     let steps = i64::from(seq) - last_seq;
@@ -236,10 +383,18 @@ proptest! {
                     }
 
                     let camera = u8::try_from(cam + 1).unwrap();
+                    // Sign with the key the model knows for this id (even if it's
+                    // retired or revoked: an attacker may hold an old key).
+                    let signing = model.keys[cam]
+                        .get(&key_id)
+                        .map_or_else(|| key_hex(cam, key_id, true), |key| key.hex.clone());
                     let mut frame = Frame::new(camera, seq, timestamp).payload(leaf(value));
+                    if !(key_id == 0 && version_1) {
+                        frame = frame.v2(key_id, &signing);
+                    }
                     match kind {
                         Kind::BadTree => frame = frame.payload(vec![0x01, 0x00]),
-                        Kind::WrongKey => frame = frame.key(support::key_for(3 - camera)),
+                        Kind::WrongKey => frame = frame.key(WRONG_KEY),
                         _ => {}
                     }
                     let mut bytes = frame.bytes();
@@ -251,7 +406,8 @@ proptest! {
                     let tree_ok = !matches!(kind, Kind::BadTree);
 
                     let response = harness.send(&receive_line(&hex::encode(&bytes)));
-                    let expected = model.receive(&cfg, cam, seq, timestamp, tag_ok, tree_ok);
+                    let expected =
+                        model.receive(&cfg, cam, key_id, seq, timestamp, tag_ok, tree_ok);
                     match expected {
                         None => {
                             prop_assert_eq!(&response["status"], "error", "{}", response);
@@ -262,6 +418,7 @@ proptest! {
                             prop_assert_eq!(&response["status"], "ok", "{}", response);
                             let got = &response["payload"];
                             prop_assert_eq!(&got["frame"]["seq"], &json!(seq));
+                            prop_assert_eq!(&got["frame"]["key_id"], &json!(key_id));
                             prop_assert_eq!(&got["frame"]["timestamp"], &json!(outcome.timestamp));
                             prop_assert_eq!(&got["frame"]["corrected"], &json!(outcome.corrected));
                             prop_assert_eq!(&got["frame"]["tree"], &json!([value]));

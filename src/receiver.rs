@@ -5,8 +5,11 @@
 //! then [`Receiver::commit`], which applies the plan with steps that can't fail.
 //! A rejected frame therefore changes nothing.
 //!
-//! If a panic ever escapes the commit (a bug), the receiver can't vouch for its
-//! state, so it stops accepting frames: see [`Receiver::is_halted`].
+//! Key management (`add_key`, `revoke_key`) follows the same pattern: decide,
+//! then apply.
+//!
+//! If a panic ever escapes a commit (a bug), the receiver can't vouch for its
+//! state, so it stops changing it: see [`Receiver::is_halted`].
 
 use std::fmt;
 
@@ -15,7 +18,8 @@ use serde::Serialize;
 use crate::camera::{Camera, PerCamera};
 use crate::config::Config;
 use crate::frame::{self, FrameError, RawFrame};
-use crate::key::Key;
+use crate::key::{Key, KeyId};
+use crate::keyring::{AddKeyError, KeyEntry, Keyring, Unusable};
 use crate::sync::{Pending, Queues, SyncPlan, SyncRecord};
 use crate::timeline::{self, Anchor, Millis};
 use crate::tree::{Tree, TreeError};
@@ -24,7 +28,7 @@ use crate::tree::{Tree, TreeError};
 #[derive(Debug)]
 pub struct Receiver {
     config: Config,
-    keys: PerCamera<Key>,
+    keys: PerCamera<Keyring>,
     /// The last accepted frame from each camera.
     last: PerCamera<Option<Anchor>>,
     queues: Queues,
@@ -37,6 +41,7 @@ pub struct Receiver {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Accepted {
     pub camera: Camera,
+    pub key_id: KeyId,
     pub seq: u32,
     pub timestamp: Millis,
     pub corrected: bool,
@@ -48,19 +53,22 @@ pub struct Accepted {
 #[derive(Debug)]
 struct Plan {
     camera: Camera,
+    key_id: KeyId,
     anchor: Anchor,
     accepted: Accepted,
     sync: SyncPlan,
 }
 
 impl Receiver {
-    /// A receiver with no frames accepted yet.
+    /// A receiver with no frames accepted yet. Each camera's `init` key is
+    /// its key 0.
     #[must_use]
     pub fn new(config: Config, keys: PerCamera<Key>) -> Self {
+        let (cam1, cam2) = keys.into_parts();
         Self {
             queues: Queues::new(config.max_pending()),
             config,
-            keys,
+            keys: PerCamera::new(Keyring::new(cam1), Keyring::new(cam2)),
             last: PerCamera::default(),
             commit_in_progress: false,
         }
@@ -87,13 +95,25 @@ impl Receiver {
 
     /// Runs every check, in order, and computes the frame's effects.
     fn plan(&self, frame_hex: &str) -> Result<Plan, ReceiveError> {
-        // 1-3: hex, version, layout. Only the camera is readable afterwards.
+        // 1-3: hex, version, layout. Only the camera and key id are readable.
         let bytes = frame::decode_hex(frame_hex)?;
         let raw = RawFrame::parse(&bytes)?;
         let camera = raw.camera();
+        let key_id = raw.key_id();
 
-        // 5: the tag. (Key status, step 4, arrives with key rotation.)
-        let frame = raw.verify(self.keys.get(camera))?;
+        // 4: key status. A revoked or retired key isn't even tried.
+        let key = self
+            .keys
+            .get(camera)
+            .usable(key_id)
+            .map_err(|reason| ReceiveError::Key {
+                camera,
+                key_id,
+                reason,
+            })?;
+
+        // 5: the tag.
+        let frame = raw.verify(key)?;
         let seq = frame.seq();
 
         // 6: replay. Only ever judges a seq the camera really sent.
@@ -115,6 +135,7 @@ impl Receiver {
         let pending = Pending {
             seq,
             timestamp: corrected.timestamp,
+            key_id,
         };
         let sync = self
             .queues
@@ -123,12 +144,14 @@ impl Receiver {
 
         Ok(Plan {
             camera,
+            key_id,
             anchor: Anchor {
                 seq,
                 timestamp: corrected.timestamp,
             },
             accepted: Accepted {
                 camera,
+                key_id,
                 seq,
                 timestamp: corrected.timestamp,
                 corrected: corrected.corrected,
@@ -143,9 +166,68 @@ impl Receiver {
     fn commit(&mut self, plan: Plan) -> Accepted {
         self.commit_in_progress = true;
         *self.last.get_mut(plan.camera) = Some(plan.anchor);
+        self.keys.get_mut(plan.camera).mark_used(plan.key_id);
         self.queues.apply(&plan.sync);
         self.commit_in_progress = false;
         plan.accepted
+    }
+
+    /// Provisions `key` as `camera`'s key `key_id`.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a revoked id, an id the camera has moved past, and a different key
+    /// under an id already provisioned. Re-adding the identical key succeeds and
+    /// changes nothing.
+    pub fn add_key(
+        &mut self,
+        camera: Camera,
+        key_id: KeyId,
+        key: Key,
+    ) -> Result<(), KeyCommandError> {
+        if self.is_halted() {
+            return Err(KeyCommandError::Halted);
+        }
+        let plan = self
+            .keys
+            .get(camera)
+            .plan_add(key_id, key)
+            .map_err(|reason| KeyCommandError::Add {
+                camera,
+                key_id,
+                reason,
+            })?;
+        self.commit_in_progress = true;
+        self.keys.get_mut(camera).apply_add(plan);
+        self.commit_in_progress = false;
+        Ok(())
+    }
+
+    /// Revokes `camera`'s key `key_id`: frames using it are rejected from now on,
+    /// and frames it authenticated that are still waiting to be paired are
+    /// dropped without being emitted. Revoking a revoked key changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a key id that was never provisioned.
+    pub fn revoke_key(&mut self, camera: Camera, key_id: KeyId) -> Result<(), KeyCommandError> {
+        if self.is_halted() {
+            return Err(KeyCommandError::Halted);
+        }
+        let plan = self
+            .keys
+            .get(camera)
+            .plan_revoke(key_id)
+            .map_err(|reason| KeyCommandError::Unusable {
+                camera,
+                key_id,
+                reason,
+            })?;
+        self.commit_in_progress = true;
+        self.keys.get_mut(camera).apply_revoke(plan);
+        self.queues.drop_key(camera, key_id);
+        self.commit_in_progress = false;
+        Ok(())
     }
 
     /// The state reported by `get_state` and other commands.
@@ -156,6 +238,7 @@ impl Receiver {
                 last_seq: last.map(|anchor| anchor.seq),
                 last_timestamp: last.map(|anchor| anchor.timestamp),
                 pending: self.queues.pending_seqs(camera).collect(),
+                keys: self.keys.get(camera).entries(),
             }),
         }
     }
@@ -173,12 +256,18 @@ pub struct CameraState {
     pub last_seq: Option<u32>,
     pub last_timestamp: Option<Millis>,
     pub pending: Vec<u32>,
+    pub keys: Vec<KeyEntry>,
 }
 
 /// Why a frame was rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReceiveError {
     Frame(FrameError),
+    Key {
+        camera: Camera,
+        key_id: KeyId,
+        reason: Unusable,
+    },
     Stale {
         camera: Camera,
         seq: u32,
@@ -207,6 +296,11 @@ impl fmt::Display for ReceiveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Frame(error) => error.fmt(f),
+            Self::Key {
+                camera,
+                key_id,
+                reason,
+            } => write!(f, "{camera} key {key_id} {reason}"),
             Self::Stale { camera, seq } => write!(f, "stale or replayed frame: {camera} seq {seq}"),
             Self::NegativeTimestamp(timestamp) => {
                 write!(f, "malformed frame: negative timestamp {timestamp}")
@@ -221,6 +315,53 @@ impl fmt::Display for ReceiveError {
 }
 
 impl std::error::Error for ReceiveError {}
+
+/// Why `add_key` or `revoke_key` was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyCommandError {
+    Add {
+        camera: Camera,
+        key_id: KeyId,
+        reason: AddKeyError,
+    },
+    Unusable {
+        camera: Camera,
+        key_id: KeyId,
+        reason: Unusable,
+    },
+    Halted,
+}
+
+impl fmt::Display for KeyCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Add {
+                camera,
+                key_id,
+                reason,
+            } => match reason {
+                AddKeyError::Revoked => write!(f, "{camera} key {key_id} is revoked"),
+                AddKeyError::Retired => write!(f, "{camera} key {key_id} is retired"),
+                AddKeyError::BelowCurrent { current } => write!(
+                    f,
+                    "{camera} key {key_id} would be retired at once: {camera} already uses key {current}"
+                ),
+                AddKeyError::DifferentKey => write!(
+                    f,
+                    "{camera} key {key_id} is already provisioned with a different key"
+                ),
+            },
+            Self::Unusable {
+                camera,
+                key_id,
+                reason,
+            } => write!(f, "{camera} key {key_id} {reason}"),
+            Self::Halted => ReceiveError::Halted.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for KeyCommandError {}
 
 #[cfg(test)]
 mod tests {
@@ -260,7 +401,27 @@ mod tests {
         r.commit_in_progress = true;
         assert!(r.is_halted());
         assert_eq!(r.receive(SPEC_FRAME), Err(ReceiveError::Halted));
-        // State is still reported, for diagnosis.
+        let key = Key::from_hex(&"11".repeat(32)).unwrap();
+        assert_eq!(
+            r.add_key(Camera::Cam1, KeyId(1), key),
+            Err(KeyCommandError::Halted)
+        );
+        assert_eq!(
+            r.revoke_key(Camera::Cam1, KeyId::INITIAL),
+            Err(KeyCommandError::Halted)
+        );
+        assert_eq!(
+            KeyCommandError::Halted.to_string(),
+            ReceiveError::Halted.to_string()
+        );
+        // Nothing changed, and state is still reported, for diagnosis.
+        assert_eq!(
+            r.state().cameras.get(Camera::Cam1).keys,
+            vec![KeyEntry {
+                key_id: KeyId::INITIAL,
+                status: crate::keyring::KeyStatus::Active
+            }]
+        );
         assert_eq!(r.state().cameras.get(Camera::Cam1).last_seq, None);
     }
 }

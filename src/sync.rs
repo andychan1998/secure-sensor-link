@@ -21,6 +21,7 @@ use serde::Serialize;
 
 use crate::camera::{Camera, PerCamera};
 use crate::config::Config;
+use crate::key::KeyId;
 use crate::timeline::Millis;
 
 /// An accepted frame waiting for a partner.
@@ -28,6 +29,8 @@ use crate::timeline::Millis;
 pub struct Pending {
     pub seq: u32,
     pub timestamp: Millis,
+    /// The key that authenticated the frame, so revoking it can drop the frame.
+    pub key_id: KeyId,
 }
 
 /// One record of the synchronized stream: a pair, or a frame that can never be
@@ -166,6 +169,15 @@ impl Queues {
         })
     }
 
+    /// Removes `camera`'s waiting frames that were authenticated with `key_id`,
+    /// without emitting them. Used when that key is revoked: the frames might
+    /// have been forged with it and haven't been paired yet. Can't fail.
+    pub fn drop_key(&mut self, camera: Camera, key_id: KeyId) {
+        self.queues
+            .get_mut(camera)
+            .retain(|frame| frame.key_id != key_id);
+    }
+
     /// Carries out a plan made by [`Queues::plan`] on these same queues.
     ///
     /// Only removes from the front and pushes onto space reserved in
@@ -198,7 +210,11 @@ mod tests {
     }
 
     fn frame(seq: u32, timestamp: Millis) -> Pending {
-        Pending { seq, timestamp }
+        Pending {
+            seq,
+            timestamp,
+            key_id: KeyId(0),
+        }
     }
 
     /// Plans and applies, returning the records.
@@ -345,6 +361,25 @@ mod tests {
                 pair(1102, 3, 1),
             ]
         );
+    }
+
+    #[test]
+    fn dropping_a_key_removes_only_its_frames() {
+        let cfg = config(20, 4);
+        let mut q = Queues::new(4);
+        let keyed = |seq, timestamp, key| Pending {
+            seq,
+            timestamp,
+            key_id: KeyId(key),
+        };
+        add(&mut q, Camera::Cam1, keyed(1, 1000, 0), &cfg);
+        add(&mut q, Camera::Cam1, keyed(2, 1050, 1), &cfg);
+        add(&mut q, Camera::Cam1, keyed(3, 1100, 0), &cfg);
+        // Same key id on the other camera is a different key: untouched.
+        q.drop_key(Camera::Cam2, KeyId(0));
+        assert_eq!(pending(&q, Camera::Cam1), vec![1, 2, 3]);
+        q.drop_key(Camera::Cam1, KeyId(0));
+        assert_eq!(pending(&q, Camera::Cam1), vec![2]);
     }
 
     #[test]

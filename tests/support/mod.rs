@@ -25,11 +25,14 @@ pub fn key_for(camera: u8) -> &'static str {
     if camera == 2 { KEY2 } else { KEY1 }
 }
 
-/// A version 1 frame, built field by field so tests can make any of them wrong.
+/// A frame, built field by field so tests can make any of them wrong. Version 1
+/// by default; [`Frame::v2`] switches to version 2 with a key id.
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub version: u8,
     pub camera: u8,
+    /// Written only in version 2 frames.
+    pub key_id: u8,
     pub seq: u32,
     pub timestamp: i64,
     pub payload: Vec<u8>,
@@ -44,6 +47,7 @@ impl Frame {
         Self {
             version: 1,
             camera,
+            key_id: 0,
             seq,
             timestamp,
             payload: EMPTY_TREE.to_vec(),
@@ -54,6 +58,14 @@ impl Frame {
 
     pub fn payload(mut self, payload: Vec<u8>) -> Self {
         self.payload = payload;
+        self
+    }
+
+    /// A version 2 frame using `key_id`, signed with `key`.
+    pub fn v2(mut self, key_id: u8, key: &str) -> Self {
+        self.version = 2;
+        self.key_id = key_id;
+        key.clone_into(&mut self.key);
         self
     }
 
@@ -68,6 +80,9 @@ impl Frame {
             .payload_len
             .unwrap_or_else(|| u16::try_from(self.payload.len()).unwrap());
         let mut bytes = vec![self.version, self.camera];
+        if self.version == 2 {
+            bytes.push(self.key_id);
+        }
         bytes.extend_from_slice(&self.seq.to_be_bytes());
         bytes.extend_from_slice(&self.timestamp.to_be_bytes());
         bytes.extend_from_slice(&payload_len.to_be_bytes());
@@ -121,6 +136,15 @@ pub fn receive_line(frame_hex: &str) -> String {
 }
 
 pub const GET_STATE: &str = r#"{"command":"get_state","parameters":{}}"#;
+
+pub fn add_key_line(camera: &str, key_id: u64, key: &str) -> String {
+    json!({"command": "add_key", "parameters": {"camera": camera, "key_id": key_id, "key": key}})
+        .to_string()
+}
+
+pub fn revoke_key_line(camera: &str, key_id: u64) -> String {
+    json!({"command": "revoke_key", "parameters": {"camera": camera, "key_id": key_id}}).to_string()
+}
 
 /// A session that hands back each response as JSON.
 #[derive(Default)]

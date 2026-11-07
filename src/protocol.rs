@@ -25,8 +25,8 @@ use serde_json::value::RawValue;
 
 use crate::camera::{Camera, PerCamera};
 use crate::config::{Config, ConfigError, ConfigInput};
-use crate::key::{Key, KeyError};
-use crate::receiver::{Accepted, ReceiveError, Receiver, State};
+use crate::key::{Key, KeyError, KeyId};
+use crate::receiver::{Accepted, KeyCommandError, ReceiveError, Receiver, State};
 use crate::sync::SyncRecord;
 use crate::timeline::Millis;
 
@@ -87,6 +87,23 @@ impl Session {
                 let NoParams {} = parse(parameters)?;
                 Ok(Payload::State(self.receiver()?.state()))
             }
+            "add_key" => {
+                let params: AddKeyParams<'_> = parse(parameters)?;
+                let camera = camera(params.camera)?;
+                let key_id = key_id(params.key_id)?;
+                let key = Key::from_hex(params.key.0).map_err(CommandError::KeyText)?;
+                let receiver = self.receiver_mut()?;
+                receiver.add_key(camera, key_id, key)?;
+                Ok(Payload::State(receiver.state()))
+            }
+            "revoke_key" => {
+                let params: RevokeKeyParams<'_> = parse(parameters)?;
+                let camera = camera(params.camera)?;
+                let key_id = key_id(params.key_id)?;
+                let receiver = self.receiver_mut()?;
+                receiver.revoke_key(camera, key_id)?;
+                Ok(Payload::State(receiver.state()))
+            }
             other => Err(CommandError::UnknownCommand(abbreviate(other))),
         }
     }
@@ -121,6 +138,19 @@ impl Session {
     }
 }
 
+fn camera(name: &str) -> Result<Camera, CommandError> {
+    Camera::ALL
+        .into_iter()
+        .find(|camera| camera.name() == name)
+        .ok_or_else(|| CommandError::UnknownCamera(abbreviate(name)))
+}
+
+fn key_id(value: u64) -> Result<KeyId, CommandError> {
+    u8::try_from(value)
+        .map(KeyId)
+        .map_err(|_| CommandError::KeyIdOutOfRange(value))
+}
+
 fn decode_key(camera: Camera, text: HexText<'_>) -> Result<Key, CommandError> {
     Key::from_hex(text.0).map_err(|error| CommandError::Key { camera, error })
 }
@@ -136,9 +166,15 @@ fn parse<'a, T: Deserialize<'a>>(raw: &'a RawValue) -> Result<T, CommandError> {
 }
 
 /// The first 32 characters of attacker-chosen text, for error messages.
+/// A name from the input, cut short for an error message.
 fn abbreviate(text: &str) -> String {
-    const LIMIT: usize = 32;
-    let mut short: String = text.chars().take(LIMIT).collect();
+    truncate(text, 32)
+}
+
+/// `text` cut to at most `limit` characters, marked with "..." if it was cut.
+/// Error messages built from input stay small, however large the input line.
+fn truncate(text: &str, limit: usize) -> String {
+    let mut short: String = text.chars().take(limit).collect();
     if short.len() < text.len() {
         short.push_str("...");
     }
@@ -254,6 +290,22 @@ struct ReceiveParams<'a> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AddKeyParams<'a> {
+    camera: &'a str,
+    key_id: u64,
+    #[serde(borrow)]
+    key: HexText<'a>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeKeyParams<'a> {
+    camera: &'a str,
+    key_id: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NoParams {}
 
 /// A hex string read in place from the input line.
@@ -327,6 +379,7 @@ pub struct Received {
 #[derive(Debug, Serialize)]
 struct FrameView {
     camera: Camera,
+    key_id: KeyId,
     seq: u32,
     timestamp: Millis,
     corrected: bool,
@@ -338,6 +391,7 @@ impl From<Accepted> for Received {
         Self {
             frame: FrameView {
                 camera: accepted.camera,
+                key_id: accepted.key_id,
                 seq: accepted.seq,
                 timestamp: accepted.timestamp,
                 corrected: accepted.corrected,
@@ -361,14 +415,22 @@ enum CommandError {
     AlreadyInitialized,
     Config(ConfigError),
     Key { camera: Camera, error: KeyError },
+    KeyText(KeyError),
+    UnknownCamera(String),
+    KeyIdOutOfRange(u64),
     Receive(ReceiveError),
+    KeyCommand(KeyCommandError),
     Internal,
 }
 
 impl CommandError {
+    /// A JSON parse error. serde's message can quote input (an unknown field
+    /// name, a string of the wrong type), so it is capped; keys and frames are
+    /// never quoted, because [`HexText`] rejects them without echo.
     #[allow(clippy::needless_pass_by_value)]
     fn invalid(error: serde_json::Error) -> Self {
-        Self::Invalid(error.to_string())
+        const LIMIT: usize = 200;
+        Self::Invalid(truncate(&error.to_string(), LIMIT))
     }
 }
 
@@ -384,6 +446,12 @@ impl From<ReceiveError> for CommandError {
     }
 }
 
+impl From<KeyCommandError> for CommandError {
+    fn from(error: KeyCommandError) -> Self {
+        Self::KeyCommand(error)
+    }
+}
+
 impl fmt::Display for CommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -395,7 +463,13 @@ impl fmt::Display for CommandError {
             Self::AlreadyInitialized => f.write_str("already initialized"),
             Self::Config(error) => error.fmt(f),
             Self::Key { camera, error } => write!(f, "keys.{camera} {error}"),
+            Self::KeyText(error) => write!(f, "key {error}"),
+            Self::UnknownCamera(name) => write!(f, "camera must be cam1 or cam2, got {name:?}"),
+            Self::KeyIdOutOfRange(value) => {
+                write!(f, "key_id must be from 0 to 255, got {value}")
+            }
             Self::Receive(error) => error.fmt(f),
+            Self::KeyCommand(error) => error.fmt(f),
             Self::Internal => f.write_str("internal error"),
         }
     }
@@ -528,7 +602,31 @@ mod tests {
     #[test]
     fn abbreviates_long_names() {
         assert_eq!(abbreviate("short"), "short");
+        assert_eq!(abbreviate(&"x".repeat(32)), "x".repeat(32));
         let long = "x".repeat(100);
         assert_eq!(abbreviate(&long), format!("{}...", "x".repeat(32)));
+        // Counts characters, not bytes.
+        assert_eq!(
+            abbreviate(&"é".repeat(40)),
+            format!("{}...", "é".repeat(32))
+        );
+    }
+
+    #[test]
+    fn json_errors_quoting_input_are_capped() {
+        let mut session = Session::default();
+        let long = "y".repeat(10_000);
+        let unknown_field = format!(r#"{{"command":"get_state","parameters":{{}},"{long}":1}}"#);
+        let escaped_command = format!(
+            r#"{{"command":"get{}u005fstate{long}","parameters":{{}}}}"#,
+            char::from(0x5c_u8)
+        );
+        for line in [unknown_field, escaped_command] {
+            let response = serde_json::to_value(session.handle_line(line.as_bytes())).unwrap();
+            let message = response["payload"]["message"].as_str().unwrap();
+            assert!(message.starts_with("invalid command: "), "{message}");
+            assert!(message.ends_with("yyy..."), "{message}");
+            assert_eq!(message.chars().count(), "invalid command: ".len() + 200 + 3);
+        }
     }
 }

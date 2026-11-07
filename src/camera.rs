@@ -106,6 +106,11 @@ impl<T> PerCamera<T> {
         }
     }
 
+    /// The two values, cam1's first.
+    pub fn into_parts(self) -> (T, T) {
+        (self.cam1, self.cam2)
+    }
+
     /// Applies `f` to each camera's value.
     pub fn map<U>(&self, mut f: impl FnMut(Camera, &T) -> U) -> PerCamera<U> {
         PerCamera {
