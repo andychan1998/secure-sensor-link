@@ -1,0 +1,16 @@
+# Mutants that can't change observable behavior, and why. Everything else must
+# be caught by a test.
+exclude_re = [
+    # Erasing a key's bytes when it's dropped: checking freed memory would need
+    # unsafe code, which the crate forbids. The erasure itself is the HMAC
+    # library's zeroize (volatile writes the compiler may not remove).
+    'replace <impl Drop for Key>::drop with \(\)',
+    # Pairing: the "which frame is older" comparison only runs when the two
+    # timestamps differ by more than the window, so they are never equal and
+    # `<` and `<=` behave the same.
+    'src/sync\.rs:.*: replace < with <= in Queues::plan',
+    # Adding a key: keys are never removed, so the camera's current key is
+    # always provisioned and a new id never equals it; `<` and `<=` behave
+    # the same.
+    'src/keyring\.rs:.*: replace < with <= in Keyring::with_added',
+]

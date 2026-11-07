@@ -1,0 +1,52 @@
+# Runs on every push and pull request.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      # Installs the version pinned in rust-toolchain.toml, with rustfmt and clippy.
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # Doc comments must build without broken or private links.
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo test --locked
+      # Release builds keep overflow checks on; run the tests that way too.
+      - run: cargo test --locked --release
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install
+      - run: rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --locked --summary-only
+
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Known vulnerabilities, licenses and sources (see deny.toml).
+      - uses: EmbarkStudios/cargo-deny-action@v2
