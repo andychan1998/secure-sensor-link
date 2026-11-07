@@ -8,8 +8,11 @@
 //!   rejected (cameras only move forward through their keys);
 //! - revoked: suspected compromised; frames using it are rejected from now on.
 //!
-//! Only usable keys keep their bytes. A key's bytes are erased the moment it is
-//! retired or revoked, because it can never verify a frame again.
+//! Only usable keys keep their bytes. Changes are planned on a copy of the
+//! keyring, which then replaces the old one; dropping the old one erases the
+//! bytes of every key the change retired or revoked, because such a key can
+//! never verify a frame again. Each key's bytes sit in their own allocation,
+//! so planning and moving keys leaves no stray copies behind (see [`Key`]).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -166,8 +169,10 @@ impl Keyring {
             Some(Slot::Revoked) => Ok(None),
             Some(Slot::Usable(_) | Slot::Retired) => {
                 let mut next = self.duplicate();
-                // Dropping a usable key erases its bytes.
-                next.slots.insert(id, Slot::Revoked);
+                if let Some(slot) = next.slots.get_mut(&id) {
+                    // Replaced in place: dropping a usable key erases its bytes.
+                    *slot = Slot::Revoked;
+                }
                 Ok(Some(next))
             }
         }

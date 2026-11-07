@@ -385,7 +385,6 @@ dependencies = [
 name = "secure-sensor-link"
 version = "0.1.0"
 dependencies = [
- "ctutils",
  "hex",
  "hmac",
  "proptest",

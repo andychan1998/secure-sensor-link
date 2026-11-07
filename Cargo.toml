@@ -14,8 +14,6 @@ publish = false
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 hex = "0.4.3"
-# Constant-time comparison: the crate hmac itself uses to check tags.
-ctutils = "0.4.8"
 hmac = { version = "0.13.0", features = ["zeroize"] }
 sha2 = { version = "0.11.1", default-features = false, features = ["zeroize"] }
 

@@ -3,7 +3,8 @@
 //!
 //! Commands arrive as newline-delimited JSON on stdin and each gets one JSON line
 //! on stdout; see [`protocol::run`]. A frame passes through the checks in this
-//! order, and nothing changes until every check passes:
+//! order, and nothing changes unless every check passes (with one exception
+//! after a restart, described in [`floor`]):
 //!
 //! 1. hex, then 2. version, then 3. layout (camera, exact length) — the only
 //!    reads before the tag, just enough to pick the key and find the tag;
@@ -32,6 +33,7 @@ pub mod camera;
 pub mod config;
 pub mod floor;
 pub mod frame;
+pub mod input;
 pub mod key;
 pub mod keyring;
 pub mod protocol;

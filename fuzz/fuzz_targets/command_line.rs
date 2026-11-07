@@ -12,12 +12,12 @@ use secure_sensor_link::protocol::Session;
 
 const INIT: &str = r#"{"command":"init","parameters":{"period_ms":50,"max_jitter_ms":5,"pair_window_ms":20,"max_pending":4,"persist_interval":3,"keys":{"cam1":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","cam2":"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"}}}"#;
 
-/// Error messages stay this short whatever the input (the longest is a JSON
-/// error capped at 200 characters plus a prefix).
-const MAX_MESSAGE_LEN: usize = 256;
+/// Error messages stay this short, in characters, whatever the input (the
+/// longest is a JSON error capped at 200 characters, plus a prefix).
+const MAX_MESSAGE_CHARS: usize = 256;
 
 fuzz_target!(|data: &[u8]| {
-    let mut session = Session::default();
+    let mut session: Session = Session::default();
     let init = respond(&mut session, INIT.as_bytes());
     assert_eq!(init["status"], "ok");
     for line in data.split(|&byte| byte == b'\n') {
@@ -38,7 +38,7 @@ fn respond(session: &mut Session, line: &[u8]) -> serde_json::Value {
             String::from_utf8_lossy(line)
         );
         assert!(!message.starts_with("receiver halted"), "{message}");
-        assert!(message.len() <= MAX_MESSAGE_LEN, "{message}");
+        assert!(message.chars().count() <= MAX_MESSAGE_CHARS, "{message}");
     }
     response
 }

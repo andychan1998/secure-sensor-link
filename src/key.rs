@@ -2,19 +2,28 @@
 
 use std::fmt;
 
-use ctutils::CtEq;
+use hmac::Hmac;
+use hmac::digest::array::Array;
 use hmac::digest::zeroize::{Zeroize, ZeroizeOnDrop};
+use hmac::digest::{CtOutput, Output};
+use sha2::Sha256;
 
 /// Length of a camera key in bytes.
 pub const KEY_LEN: usize = 32;
 
 /// A camera's HMAC-SHA256 key.
 ///
-/// The bytes are erased when the key is dropped, using the HMAC library's
-/// `zeroize` support (volatile writes the compiler may not remove). The type has
-/// no `Clone`: the only copies are made by `Key::duplicate`, for storage. Its
-/// `Debug` output never shows the bytes.
-pub struct Key([u8; KEY_LEN]);
+/// The bytes live in a heap allocation of their own, so moving a `Key` copies
+/// only a pointer, and they are erased when the key is dropped, using the HMAC
+/// library's `zeroize` support (volatile writes the compiler may not remove).
+/// The type has no `Clone`: the only copies are made by `Key::duplicate`, for
+/// planning a change to a keyring and for storage, and each erases itself too.
+/// Its `Debug` output never shows the bytes.
+///
+/// What safe Rust can't reach: the HMAC library holds key-derived blocks on
+/// the stack while it sets up, and the operating system's pipe buffer holds
+/// the key text that arrived on stdin.
+pub struct Key(Box<[u8; KEY_LEN]>);
 
 impl Key {
     /// Decodes a key from exactly 64 hex characters (either case).
@@ -23,34 +32,46 @@ impl Key {
     ///
     /// Returns an error if `hex` isn't exactly 64 hex characters.
     pub fn from_hex(hex: &str) -> Result<Self, KeyError> {
-        // Start from zeros so that a half-decoded key is still erased on error.
-        let mut key = Self([0; KEY_LEN]);
         let expected = KEY_LEN.saturating_mul(2);
         if hex.len() != expected {
             return Err(KeyError::WrongLength { len: hex.len() });
         }
-        hex::decode_to_slice(hex, &mut key.0).map_err(|_| KeyError::NotHex)?;
+        // Decoded straight into the key's own allocation. It starts as zeros,
+        // and a half-decoded key is erased on error like any other.
+        let mut key = Self(Box::new([0; KEY_LEN]));
+        hex::decode_to_slice(hex, key.0.as_mut_slice()).map_err(|_| KeyError::NotHex)?;
         Ok(key)
     }
 
-    /// An explicit copy, made only where a key is written to storage or loaded
-    /// back from it (non-volatile storage must hold the keys to survive a
-    /// restart). Each copy erases itself when dropped.
+    /// An explicit copy, made only to plan a change to a keyring and to write
+    /// keys to storage or load them back (non-volatile storage must hold the
+    /// keys to survive a restart). Copied from one allocation to the other
+    /// directly, and erased when dropped like the original.
     #[must_use]
-    pub(crate) const fn duplicate(&self) -> Self {
-        Self(self.0)
+    pub(crate) fn duplicate(&self) -> Self {
+        let mut copy = Self(Box::new([0; KEY_LEN]));
+        copy.0.copy_from_slice(self.0.as_slice());
+        copy
     }
 
     /// The key bytes, for computing a tag.
-    pub(crate) const fn as_bytes(&self) -> &[u8; KEY_LEN] {
+    pub(crate) fn as_bytes(&self) -> &[u8; KEY_LEN] {
         &self.0
     }
 
     /// Whether two keys are the same, in time that doesn't depend on where
-    /// they differ, so timing can't reveal a stored key byte by byte.
+    /// they differ, so timing can't reveal a stored key byte by byte. Uses the
+    /// HMAC library's constant-time comparison, the one it checks tags with
+    /// (an HMAC-SHA256 output is 32 bytes, like a key); each side is a copy
+    /// the library erases when it's dropped.
     #[must_use]
     pub fn ct_eq(&self, other: &Self) -> bool {
-        self.0.ct_eq(&other.0).to_bool()
+        Self::comparable(self) == Self::comparable(other)
+    }
+
+    fn comparable(key: &Self) -> CtOutput<Hmac<Sha256>> {
+        let bytes: &Output<Hmac<Sha256>> = Array::cast_from_core(&key.0);
+        CtOutput::from(bytes)
     }
 }
 

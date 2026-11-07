@@ -1,6 +1,6 @@
 # secure-sensor-link
 
-A receiver that decodes, authenticates, and time-synchronizes camera frames arriving over a hostile link. Written in Rust, using only the standard library plus `serde_json`, `hex`, `hmac` + `sha2`, and `ctutils` (constant-time comparison).
+A receiver that decodes, authenticates, and time-synchronizes camera frames arriving over a hostile link. Written in Rust, using only the standard library plus `serde_json`, `hex`, and `hmac` + `sha2`, as the spec allows.
 
 The design, threat model and the reasoning behind each decision are in [DESIGN.md](DESIGN.md).
 
@@ -30,16 +30,20 @@ cargo run --release
 
 Every line gets exactly one response, including blank or malformed lines. Lines longer than 256 KiB get one error and are discarded.
 
+Commands are standard JSON with one exception: keys must be plain hex strings. A key written with an escape sequence (such as `\u0030`) is refused before it is decoded, so no copy of it is made. Error messages never repeat a value from the input, so a key pasted into the wrong field doesn't come back out.
+
 | Command | Does |
 |---|---|
 | `init` | Sets the timing limits, each camera's key 0 and, optionally, `persist_interval` (default 100). Must come first, once. |
 | `receive` | Checks one frame (version 1, or version 2 with a key id) and returns it with any newly paired frames. |
 | `get_state` | Returns each camera's last frame, waiting frames and keys. |
-| `add_key` | Provisions a new key id for a camera. Re-adding the same key is a no-op. |
+| `add_key` | Provisions a new key id for a camera. Re-adding the identical key under an active id is a no-op. |
 | `revoke_key` | Revokes a key id at once; waiting frames that used it are dropped. |
 | `restart` | Simulates a power loss: everything in memory is lost and the receiver starts again from its (simulated) non-volatile storage. |
 
-A camera moves to a key when a frame under it is accepted, and every lower key is then retired. A retired or revoked key id can never be used or provisioned again.
+A camera moves to a key when a frame under it is accepted, and every lower key is then retired. A retired or revoked key id can never be used or provisioned again. A frame naming a key id that isn't usable is reported by the key's status (for example "cam1 key 0 is retired") before its tag is checked, as in the spec's example; any other forgery is reported as an authentication failure.
+
+Each key's bytes live in one heap allocation and are erased when the key is dropped, so retired and revoked keys are erased as soon as the change is committed. Input is read through a buffer that is erased as it is consumed, and the line buffer is erased after every command and never grows, so key text doesn't linger either. `tests/memory.rs` checks all of this by searching the running receiver's memory (on Linux).
 
 Replay protection survives a restart. Before accepting a seq above its saved floor, the receiver writes a new floor, `seq + persist_interval`, to storage; after a restart, frames at or below that floor are rejected. That keeps writes within the spec's budget of `1 + (S_max - S_min) / persist_interval` per camera. Configuration and key changes are written at once. Timelines and queues start empty after a restart.
 
@@ -58,8 +62,10 @@ cargo test --test model     # random command sequences against a reference model
 | Tests | Where | What they show |
 |---|---|---|
 | Spec examples | `tests/transcripts/spec/` | The project description's examples, response by response |
-| Rules and decisions | `tests/rules.rs` | Order of checks, rejected frames change nothing, strict input, extreme values |
+| Rules and decisions | `tests/rules.rs` | Order of checks, rejected frames change nothing, strict input, no echoed values, JSON escapes, extreme values |
 | Keys | `tests/keys.rs` | Rotation, retirement and revocation, and each `add_key` / `revoke_key` error |
+| Keys in memory | `tests/memory.rs` | Searches the running receiver's memory: no copy of a retired or revoked key, and no key text, remains (Linux) |
+| Safety nets | `tests/safety_net.rs` | A storage fault mid-command gets "internal error", halts the receiver, and a restart recovers it |
 | Restarts | `tests/restart.rs` | Each restart rule, storage write counts, and a property test running a restarted receiver beside a twin that never restarts: no replay is ever accepted twice, a restart never lets in an attacker frame the twin rejects, required frames are accepted, and writes stay within budget |
 | Reference model | `tests/model.rs` | Random sequences of valid, forged, replayed and malformed frames, key additions, revocations and restarts give exactly the responses and state of a separate, plain implementation of the spec; arbitrary bytes never cause an internal error |
 | Command line | `tests/cli.rs` | The real binary over stdin and stdout |
@@ -127,6 +133,7 @@ src/
   main.rs       connects stdin and stdout to the protocol
   protocol.rs   bounded line reading, strict JSON commands, responses, panic safety net
   config.rs     init parameters, validated
+  input.rs      reading input through a buffer that erases what it hands out
   key.rs        32-byte keys that erase themselves and never print
   keyring.rs    each camera's keys: active, retired or revoked
   frame.rs      the wire format, versions 1 and 2: RawFrame (untrusted) -> VerifiedFrame (tag checked)

@@ -12,14 +12,17 @@
 
 mod support;
 
-use serde_json::json;
-use support::{Frame, GET_STATE, Harness, KEY1, KEY2, init_line, leaf, receive_line};
+use serde_json::{Value, json};
+use support::{
+    Frame, GET_STATE, Harness, KEY1, KEY2, add_key_line, init_line, leaf, receive_line,
+    revoke_key_line,
+};
 
-fn receive(harness: &mut Harness, frame: &Frame) -> serde_json::Value {
+fn receive(harness: &mut Harness, frame: &Frame) -> Value {
     harness.send(&receive_line(&frame.hex()))
 }
 
-fn accept(harness: &mut Harness, frame: &Frame) -> serde_json::Value {
+fn accept(harness: &mut Harness, frame: &Frame) -> Value {
     harness.ok(&receive_line(&frame.hex()))
 }
 
@@ -339,4 +342,128 @@ fn a_rejected_frame_is_reported_once_and_the_receiver_carries_on() {
         receive(&mut h, &Frame::new(1, 1, 1000))["status"],
         json!("ok")
     );
+}
+
+// ---- What error messages may repeat, and JSON escapes ----
+
+/// Key-shaped text that must never come back in a response.
+const SECRET: &str = "5ec2e7ababababababababababababababababababababababababababababab";
+
+#[test]
+fn the_secret_is_key_sized() {
+    assert_eq!(SECRET.len(), 64);
+}
+
+fn assert_not_echoed(response: &Value, line: &str) {
+    let text = response.to_string();
+    assert_eq!(response["status"], "error", "{line}\n{text}");
+    assert!(
+        !text.contains("5ec2e7") && !text.contains("abababab"),
+        "echoed the value: {line}\n{text}"
+    );
+}
+
+/// `line` with the JSON value at `path` replaced by `value`.
+fn with_value(line: &str, path: &[&str], value: Value) -> String {
+    let mut json: Value = serde_json::from_str(line).unwrap();
+    let mut target = &mut json;
+    for key in path {
+        target = &mut target[*key];
+    }
+    *target = value;
+    json.to_string()
+}
+
+#[test]
+fn no_value_from_the_input_is_ever_repeated() {
+    let backslash = char::from(0x5c_u8);
+    let escaped_secret = format!("{backslash}u0035{}", &SECRET[1..]);
+    let secret = || Value::String(SECRET.to_owned());
+    let init = init_line(50, 5, 20, 4);
+    let add_key = add_key_line("cam1", 1, KEY2);
+    let revoke_key = revoke_key_line("cam1", 0);
+
+    // Lines a fresh receiver sees: init's parameters.
+    let mut fresh = vec![format!("\"{SECRET}\"")];
+    for field in [
+        "period_ms",
+        "max_jitter_ms",
+        "pair_window_ms",
+        "max_pending",
+        "persist_interval",
+        "keys",
+    ] {
+        fresh.push(with_value(&init, &["parameters", field], secret()));
+    }
+    for camera in ["cam1", "cam2"] {
+        let long = Value::String(format!("{SECRET}00"));
+        fresh.push(with_value(&init, &["parameters", "keys", camera], long));
+        let escaped = with_value(&init, &["parameters", "keys", camera], json!("ESCAPED"));
+        fresh.push(escaped.replace("ESCAPED", &escaped_secret));
+    }
+    for line in &fresh {
+        let mut h = Harness::default();
+        assert_not_echoed(&h.send(line), line);
+    }
+
+    // Lines an initialized receiver sees.
+    let mut later = vec![
+        json!({"command": SECRET, "parameters": {}}).to_string(),
+        json!({"command": "get_state", "parameters": SECRET}).to_string(),
+        with_value(
+            &receive_line(SECRET),
+            &[],
+            json!({"command": "receive", "parameters": {"frame": SECRET}}),
+        ),
+        with_value(&add_key, &["parameters", "camera"], secret()),
+        with_value(&add_key, &["parameters", "key_id"], secret()),
+        with_value(
+            &add_key,
+            &["parameters", "key"],
+            Value::String(format!("{SECRET}00")),
+        ),
+        with_value(&revoke_key, &["parameters", "camera"], secret()),
+        with_value(&revoke_key, &["parameters", "key_id"], secret()),
+    ];
+    let escaped = with_value(&add_key, &["parameters", "key"], json!("ESCAPED"));
+    later.push(escaped.replace("ESCAPED", &escaped_secret));
+    let mut h = Harness::spec_config();
+    for line in &later {
+        assert_not_echoed(&h.send(line), line);
+    }
+}
+
+#[test]
+fn json_escapes_are_accepted_except_in_keys() {
+    let backslash = char::from(0x5c_u8);
+    let mut h = Harness::spec_config();
+    // A command name, camera names and a frame, each with an escape.
+    h.ok(&format!(
+        r#"{{"command":"get{backslash}u005fstate","parameters":{{}}}}"#
+    ));
+    let frame = Frame::new(1, 1, 1000).hex();
+    let escaped_frame = format!("{backslash}u00{:x}{}", frame.as_bytes()[0], &frame[1..]);
+    let accepted = h.ok(&format!(
+        r#"{{"command":"receive","parameters":{{"frame":"{escaped_frame}"}}}}"#
+    ));
+    assert_eq!(accepted["frame"]["seq"], 1);
+    h.ok(&format!(
+        r#"{{"command":"add_key","parameters":{{"camera":"cam{backslash}u0031","key_id":1,"key":"{KEY2}"}}}}"#
+    ));
+    h.ok(&format!(
+        r#"{{"command":"revoke_key","parameters":{{"camera":"cam{backslash}u0031","key_id":1}}}}"#
+    ));
+    // A key with an escape is refused, and nothing changes.
+    let before = h.state();
+    let escaped_key = format!("{backslash}u0030{}", &KEY1[1..]);
+    assert!(
+        h.error(&format!(
+            r#"{{"command":"add_key","parameters":{{"camera":"cam1","key_id":2,"key":"{escaped_key}"}}}}"#
+        ))
+        .starts_with("invalid command: keys must be plain strings of hex, without escape sequences")
+    );
+    assert_eq!(h.state(), before);
+    let mut fresh = Harness::default();
+    let init = init_line(50, 5, 20, 4).replacen(&KEY1[..1], &format!("{backslash}u0030"), 1);
+    assert!(fresh.error(&init).contains("without escape sequences"));
 }

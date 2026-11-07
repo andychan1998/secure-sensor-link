@@ -320,11 +320,11 @@ fn add_key_parameters_are_checked() {
     );
     assert_eq!(
         h.error(&add_key_line("cam3", 1, &key(1))),
-        "camera must be cam1 or cam2, got \"cam3\""
+        "camera must be cam1 or cam2"
     );
     assert_eq!(
         h.error(&add_key_line("CAM1", 1, &key(1))),
-        "camera must be cam1 or cam2, got \"CAM1\""
+        "camera must be cam1 or cam2"
     );
     assert_eq!(
         h.error(&add_key_line("cam1", 1, &"ab".repeat(31))),
@@ -388,7 +388,7 @@ fn revoking_an_unknown_key_is_rejected() {
     );
     assert_eq!(
         h.error(&revoke_key_line("cam0", 0)),
-        "camera must be cam1 or cam2, got \"cam0\""
+        "camera must be cam1 or cam2"
     );
     assert_eq!(h.state(), before);
 }

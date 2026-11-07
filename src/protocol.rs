@@ -7,13 +7,18 @@
 //! - Every line gets exactly one response, including blank lines.
 //! - Unknown fields and duplicate keys are rejected, `parameters` is required,
 //!   and numbers must be whole and in range.
-//! - Hex strings (frames and keys) are read in place from the input line, never
-//!   copied, and error messages never repeat key text.
+//! - Keys are read in place from the input line and never copied. A key
+//!   written with a JSON escape sequence is refused before the JSON library
+//!   decodes it, since the decoded copy would sit in a buffer nothing erases.
+//!   Every other string may use escapes.
+//! - Error messages never repeat a value from the input, which might be a key
+//!   in the wrong place. They may name an unknown field (capped in length).
 //!
 //! The line buffer is wiped after every command, since it may hold key text.
 //! Each command runs under a panic safety net: a bug produces an "internal error"
 //! response instead of ending the process.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, BufRead, ErrorKind, Write};
 use std::panic::{self, AssertUnwindSafe};
@@ -27,7 +32,7 @@ use crate::camera::{Camera, PerCamera};
 use crate::config::{Config, ConfigError, ConfigInput};
 use crate::key::{Key, KeyError, KeyId};
 use crate::receiver::{Accepted, KeyCommandError, ReceiveError, Receiver, State};
-use crate::storage::{MemoryStore, StorageError};
+use crate::storage::{MemoryStore, Storage, StorageError};
 use crate::sync::SyncRecord;
 use crate::timeline::Millis;
 
@@ -41,7 +46,7 @@ pub const MAX_LINE_LEN: usize = 256 * 1024;
 ///
 /// Returns an error only if reading input or writing output fails.
 pub fn run<R: BufRead, W: Write>(mut input: R, mut output: W) -> io::Result<()> {
-    let mut session = Session::default();
+    let mut session: Session = Session::default();
     let mut line = Vec::new();
     loop {
         let response = match read_line(&mut input, &mut line)? {
@@ -49,20 +54,29 @@ pub fn run<R: BufRead, W: Write>(mut input: R, mut output: W) -> io::Result<()> 
             Line::TooLong => Response::error(&CommandError::LineTooLong),
             Line::Complete => session.handle_line(&line),
         };
-        // The line may hold key text: erase it before reading the next one.
-        line.zeroize();
+        // The line may hold key text: erase it, and whatever the command left
+        // on the stack, before reading the next one.
+        erase(&mut line);
+        scrub_stack();
         write_response(&mut output, &response)?;
     }
 }
 
-/// The receiver, before and after `init`. Its storage is simulated in memory;
-/// `restart` rebuilds the receiver from that storage alone.
-#[derive(Debug, Default)]
-pub struct Session {
-    receiver: Option<Receiver<MemoryStore>>,
+/// The receiver, before and after `init`. `init` creates its storage, by
+/// default the simulated non-volatile store; `restart` rebuilds the receiver
+/// from that storage alone.
+#[derive(Debug)]
+pub struct Session<S = MemoryStore> {
+    receiver: Option<Receiver<S>>,
 }
 
-impl Session {
+impl<S> Default for Session<S> {
+    fn default() -> Self {
+        Self { receiver: None }
+    }
+}
+
+impl<S: Storage + Default> Session<S> {
     /// Handles one input line, under the panic safety net.
     pub fn handle_line(&mut self, line: &[u8]) -> Response {
         // A panic in planning leaves the state untouched, so carrying on is
@@ -76,13 +90,21 @@ impl Session {
     }
 
     fn execute(&mut self, line: &[u8]) -> Result<Payload, CommandError> {
+        // serde would quote a top-level string in its error.
+        if line
+            .trim_ascii_start()
+            .first()
+            .is_some_and(|&byte| byte != b'{')
+        {
+            return Err(CommandError::NotAnObject);
+        }
         let envelope: Envelope<'_> = serde_json::from_slice(line).map_err(CommandError::invalid)?;
         let parameters = envelope.parameters;
-        match envelope.command {
+        match envelope.command.as_ref() {
             "init" => self.init(&parse(parameters)?),
             "receive" => {
                 let params: ReceiveParams<'_> = parse(parameters)?;
-                let accepted = self.receiver_mut()?.receive(params.frame.0)?;
+                let accepted = self.receiver_mut()?.receive(&params.frame)?;
                 Ok(Payload::Received(Received::from(accepted)))
             }
             "get_state" => {
@@ -91,7 +113,7 @@ impl Session {
             }
             "add_key" => {
                 let params: AddKeyParams<'_> = parse(parameters)?;
-                let camera = camera(params.camera)?;
+                let camera = camera(&params.camera)?;
                 let key_id = key_id(params.key_id)?;
                 let key = Key::from_hex(params.key.0).map_err(CommandError::KeyText)?;
                 let receiver = self.receiver_mut()?;
@@ -100,7 +122,7 @@ impl Session {
             }
             "revoke_key" => {
                 let params: RevokeKeyParams<'_> = parse(parameters)?;
-                let camera = camera(params.camera)?;
+                let camera = camera(&params.camera)?;
                 let key_id = key_id(params.key_id)?;
                 let receiver = self.receiver_mut()?;
                 receiver.revoke_key(camera, key_id)?;
@@ -112,7 +134,7 @@ impl Session {
                 receiver.restart().map_err(CommandError::Restart)?;
                 Ok(Payload::State(receiver.state()))
             }
-            other => Err(CommandError::UnknownCommand(abbreviate(other))),
+            _ => Err(CommandError::UnknownCommand),
         }
     }
 
@@ -132,18 +154,17 @@ impl Session {
             decode_key(Camera::Cam1, keys.cam1)?,
             decode_key(Camera::Cam2, keys.cam2)?,
         );
-        let receiver =
-            Receiver::new(config, keys, MemoryStore::default()).map_err(CommandError::Init)?;
+        let receiver = Receiver::new(config, keys, S::default()).map_err(CommandError::Init)?;
         let state = receiver.state();
         self.receiver = Some(receiver);
         Ok(Payload::State(state))
     }
 
-    fn receiver(&self) -> Result<&Receiver<MemoryStore>, CommandError> {
+    fn receiver(&self) -> Result<&Receiver<S>, CommandError> {
         self.receiver.as_ref().ok_or(CommandError::NotInitialized)
     }
 
-    fn receiver_mut(&mut self) -> Result<&mut Receiver<MemoryStore>, CommandError> {
+    fn receiver_mut(&mut self) -> Result<&mut Receiver<S>, CommandError> {
         self.receiver.as_mut().ok_or(CommandError::NotInitialized)
     }
 }
@@ -152,7 +173,7 @@ fn camera(name: &str) -> Result<Camera, CommandError> {
     Camera::ALL
         .into_iter()
         .find(|camera| camera.name() == name)
-        .ok_or_else(|| CommandError::UnknownCamera(abbreviate(name)))
+        .ok_or(CommandError::UnknownCamera)
 }
 
 fn key_id(value: u64) -> Result<KeyId, CommandError> {
@@ -161,7 +182,7 @@ fn key_id(value: u64) -> Result<KeyId, CommandError> {
         .map_err(|_| CommandError::KeyIdOutOfRange(value))
 }
 
-fn decode_key(camera: Camera, text: HexText<'_>) -> Result<Key, CommandError> {
+fn decode_key(camera: Camera, text: KeyText<'_>) -> Result<Key, CommandError> {
     Key::from_hex(text.0).map_err(|error| CommandError::Key { camera, error })
 }
 
@@ -175,18 +196,42 @@ fn parse<'a, T: Deserialize<'a>>(raw: &'a RawValue) -> Result<T, CommandError> {
     serde_json::from_str(text).map_err(CommandError::invalid)
 }
 
-/// The first 32 characters of attacker-chosen text, for error messages.
-/// Deserializes a field that may be left out but, when present, must hold a
-/// value: `null` is an error rather than a silent default.
-fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
-    deserializer: D,
-) -> Result<Option<T>, D::Error> {
-    T::deserialize(deserializer).map(Some)
+/// Deserializes a whole number. Asked for a number directly, `serde_json` would
+/// quote a string it found instead, and that string might be a key in the
+/// wrong field; this says only that it was a string.
+fn whole_number<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    struct WholeNumber;
+
+    impl Visitor<'_> for WholeNumber {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a whole number")
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<u64, E> {
+            Ok(value)
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<u64, E> {
+            // Only negative numbers arrive here; a whole number, but out of range.
+            Err(E::invalid_value(de::Unexpected::Signed(value), &self))
+        }
+
+        fn visit_str<E: de::Error>(self, _text: &str) -> Result<u64, E> {
+            Err(E::invalid_type(de::Unexpected::Other("a string"), &self))
+        }
+    }
+
+    deserializer.deserialize_any(WholeNumber)
 }
 
-/// A name from the input, cut short for an error message.
-fn abbreviate(text: &str) -> String {
-    truncate(text, 32)
+/// Like [`whole_number`], for a field that may be left out but, when present,
+/// must hold a number: `null` is an error rather than a silent default.
+fn optional_whole_number<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    whole_number(deserializer).map(Some)
 }
 
 /// `text` cut to at most `limit` characters, marked with "..." if it was cut.
@@ -199,7 +244,36 @@ fn truncate(text: &str, limit: usize) -> String {
     short
 }
 
+/// How much of the stack [`scrub_stack`] overwrites: more than any command
+/// uses, since nothing in a command recurses deeply (the JSON library limits
+/// nesting, and the tree decoder doesn't recurse).
+const STACK_SCRUB_LEN: usize = 64 * 1024;
+
+/// Overwrites the stack where the command just handled ran, erasing the
+/// temporaries it left there: pieces of the input line copied out while the
+/// JSON library scanned it, and key-derived blocks the HMAC library set up.
+/// This function's own frame takes the place of the command's frames, and
+/// `zeroize` writes the zeros with volatile writes the compiler can't remove.
+#[inline(never)]
+#[expect(
+    clippy::large_stack_arrays,
+    reason = "the array is meant to lie on the stack, over the command's old frames"
+)]
+fn scrub_stack() {
+    let mut area = [0_u8; STACK_SCRUB_LEN];
+    area.zeroize();
+    std::hint::black_box(&area);
+}
+
 // ---- Input lines ----
+
+/// Erases `buf`'s bytes, then empties it. (The `zeroize` crate, as built
+/// here, erases a `Vec`'s bytes but keeps its length, so this spells out both
+/// steps.)
+fn erase(buf: &mut Vec<u8>) {
+    buf.as_mut_slice().zeroize();
+    buf.clear();
+}
 
 enum Line {
     Complete,
@@ -210,8 +284,13 @@ enum Line {
 /// Reads one line into `buf` (without the newline), storing at most
 /// [`MAX_LINE_LEN`] bytes. A longer line is consumed to its end and reported as
 /// [`Line::TooLong`].
+///
+/// `buf` is given room for the longest line before anything is read into it,
+/// so it never grows: growing would move the line to new memory and leave the
+/// old copy, which may hold key text, behind unerased.
 fn read_line<R: BufRead>(input: &mut R, buf: &mut Vec<u8>) -> io::Result<Line> {
-    buf.clear();
+    erase(buf);
+    buf.reserve_exact(MAX_LINE_LEN);
     let mut read_any = false;
     let mut too_long = false;
     loop {
@@ -236,7 +315,7 @@ fn read_line<R: BufRead>(input: &mut R, buf: &mut Vec<u8>) -> io::Result<Line> {
         if !too_long {
             if buf.len().saturating_add(chunk.len()) > MAX_LINE_LEN {
                 too_long = true;
-                buf.zeroize();
+                erase(buf);
             } else {
                 buf.extend_from_slice(chunk);
             }
@@ -277,7 +356,9 @@ fn write_response<W: Write>(output: &mut W, response: &Response) -> io::Result<(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Envelope<'a> {
-    command: &'a str,
+    /// Borrowed from the line unless it uses escapes.
+    #[serde(borrow)]
+    command: Cow<'a, str>,
     #[serde(borrow)]
     parameters: &'a RawValue,
 }
@@ -285,12 +366,16 @@ struct Envelope<'a> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InitParams<'a> {
+    #[serde(deserialize_with = "whole_number")]
     period_ms: u64,
+    #[serde(deserialize_with = "whole_number")]
     max_jitter_ms: u64,
+    #[serde(deserialize_with = "whole_number")]
     pair_window_ms: u64,
+    #[serde(deserialize_with = "whole_number")]
     max_pending: u64,
     /// Optional; when present it must be a number (`null` is rejected).
-    #[serde(default, deserialize_with = "present")]
+    #[serde(default, deserialize_with = "optional_whole_number")]
     persist_interval: Option<u64>,
     /// Kept raw so it can be checked to be an object before it's parsed.
     #[serde(borrow)]
@@ -301,31 +386,36 @@ struct InitParams<'a> {
 #[serde(deny_unknown_fields)]
 struct KeysParam<'a> {
     #[serde(borrow)]
-    cam1: HexText<'a>,
+    cam1: KeyText<'a>,
     #[serde(borrow)]
-    cam2: HexText<'a>,
+    cam2: KeyText<'a>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiveParams<'a> {
+    /// Frames aren't secret, so they may use escapes like any string.
     #[serde(borrow)]
-    frame: HexText<'a>,
+    frame: Cow<'a, str>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AddKeyParams<'a> {
-    camera: &'a str,
+    #[serde(borrow)]
+    camera: Cow<'a, str>,
+    #[serde(deserialize_with = "whole_number")]
     key_id: u64,
     #[serde(borrow)]
-    key: HexText<'a>,
+    key: KeyText<'a>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RevokeKeyParams<'a> {
-    camera: &'a str,
+    #[serde(borrow)]
+    camera: Cow<'a, str>,
+    #[serde(deserialize_with = "whole_number")]
     key_id: u64,
 }
 
@@ -333,34 +423,26 @@ struct RevokeKeyParams<'a> {
 #[serde(deny_unknown_fields)]
 struct NoParams {}
 
-/// A hex string read in place from the input line.
+/// A key's text, read in place from the input line.
 ///
-/// Strings containing JSON escape sequences are rejected rather than copied,
-/// and the error never repeats the string, which may be a key.
+/// It's taken as raw JSON, so the JSON library never decodes it: a decoded
+/// copy would sit in the library's own buffer, which nothing erases. It must
+/// be a plain JSON string with no escape sequences; anything else is refused,
+/// and the error never repeats it.
 #[derive(Clone, Copy)]
-struct HexText<'a>(&'a str);
+struct KeyText<'a>(&'a str);
 
-impl<'de: 'a, 'a> Deserialize<'de> for HexText<'a> {
+impl<'de: 'a, 'a> Deserialize<'de> for KeyText<'a> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct HexVisitor;
-
-        impl<'de> Visitor<'de> for HexVisitor {
-            type Value = &'de str;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a hex string")
-            }
-
-            fn visit_borrowed_str<E: de::Error>(self, text: &'de str) -> Result<Self::Value, E> {
-                Ok(text)
-            }
-
-            fn visit_str<E: de::Error>(self, _text: &str) -> Result<Self::Value, E> {
-                Err(E::custom("hex strings may not contain escape sequences"))
-            }
-        }
-
-        deserializer.deserialize_str(HexVisitor).map(HexText)
+        let raw = <&RawValue>::deserialize(deserializer)?;
+        raw.get()
+            .strip_prefix('"')
+            .and_then(|text| text.strip_suffix('"'))
+            .filter(|text| !text.contains('\\'))
+            .map(KeyText)
+            .ok_or_else(|| {
+                de::Error::custom("keys must be plain strings of hex, without escape sequences")
+            })
     }
 }
 
@@ -435,13 +517,13 @@ enum CommandError {
     LineTooLong,
     Invalid(String),
     NotAnObject,
-    UnknownCommand(String),
+    UnknownCommand,
     NotInitialized,
     AlreadyInitialized,
     Config(ConfigError),
     Key { camera: Camera, error: KeyError },
     KeyText(KeyError),
-    UnknownCamera(String),
+    UnknownCamera,
     KeyIdOutOfRange(u64),
     Receive(ReceiveError),
     KeyCommand(KeyCommandError),
@@ -451,9 +533,10 @@ enum CommandError {
 }
 
 impl CommandError {
-    /// A JSON parse error. serde's message can quote input (an unknown field
-    /// name, a string of the wrong type), so it is capped; keys and frames are
-    /// never quoted, because [`HexText`] rejects them without echo.
+    /// A JSON parse error. serde's message can name an unknown field, so it
+    /// is capped. It never quotes a value: keys are refused by [`KeyText`],
+    /// numbers by [`whole_number`], and a line or `parameters` that isn't an
+    /// object is refused before serde sees it.
     #[allow(clippy::needless_pass_by_value)]
     fn invalid(error: serde_json::Error) -> Self {
         const LIMIT: usize = 200;
@@ -485,13 +568,13 @@ impl fmt::Display for CommandError {
             Self::LineTooLong => write!(f, "input line exceeds {MAX_LINE_LEN} bytes"),
             Self::Invalid(detail) => write!(f, "invalid command: {detail}"),
             Self::NotAnObject => f.write_str("invalid command: expected a JSON object"),
-            Self::UnknownCommand(name) => write!(f, "unknown command {name:?}"),
+            Self::UnknownCommand => f.write_str("unknown command"),
             Self::NotInitialized => f.write_str("not initialized: the first command must be init"),
             Self::AlreadyInitialized => f.write_str("already initialized"),
             Self::Config(error) => error.fmt(f),
             Self::Key { camera, error } => write!(f, "keys.{camera} {error}"),
             Self::KeyText(error) => write!(f, "key {error}"),
-            Self::UnknownCamera(name) => write!(f, "camera must be cam1 or cam2, got {name:?}"),
+            Self::UnknownCamera => f.write_str("camera must be cam1 or cam2"),
             Self::KeyIdOutOfRange(value) => {
                 write!(f, "key_id must be from 0 to 255, got {value}")
             }
@@ -538,6 +621,34 @@ mod tests {
     }
 
     #[test]
+    fn an_overlong_line_is_never_held_in_memory() {
+        let input = [vec![b'a'; MAX_LINE_LEN * 4], b"\n{}\n".to_vec()].concat();
+        // In one chunk, and in chunks the size of stdin's own buffer.
+        for chunk in [input.len(), 8 * 1024] {
+            let mut reader = io::BufReader::with_capacity(chunk, input.as_slice());
+            let mut buf = Vec::new();
+            assert!(matches!(
+                read_line(&mut reader, &mut buf).unwrap(),
+                Line::TooLong
+            ));
+            assert!(
+                buf.is_empty(),
+                "kept {} bytes of an overlong line",
+                buf.len()
+            );
+            let capacity = buf.capacity();
+            assert!((MAX_LINE_LEN..2 * MAX_LINE_LEN).contains(&capacity));
+            // The next line goes into the same memory: the buffer never grows.
+            assert!(matches!(
+                read_line(&mut reader, &mut buf).unwrap(),
+                Line::Complete
+            ));
+            assert_eq!(buf, b"{}");
+            assert_eq!(buf.capacity(), capacity);
+        }
+    }
+
+    #[test]
     fn an_overlong_line_gets_one_error_and_the_next_line_still_works() {
         let mut input = vec![b'x'; MAX_LINE_LEN + 1];
         input.extend_from_slice(b"\n{\"command\":\"get_state\",\"parameters\":{}}\n");
@@ -556,18 +667,23 @@ mod tests {
     }
 
     #[test]
-    fn hex_text_with_escapes_is_rejected_without_echoing_it() {
-        // The frame is the JSON escape for "0" twice (backslash written as a byte
-        // so no tool or editor turns it into a literal "0").
+    fn a_key_with_an_escape_is_refused_without_echoing_it() {
+        // A key starting with the JSON escape for "5" (backslash written as a
+        // byte so no tool or editor turns it into a literal "5").
         let backslash = char::from(0x5c_u8);
+        let key = format!("{backslash}u0035ec2e7{}", "ab".repeat(29));
         let line = format!(
-            r#"{{"command":"receive","parameters":{{"frame":"{backslash}u0030{backslash}u0030"}}}}"#
+            r#"{{"command":"add_key","parameters":{{"camera":"cam1","key_id":1,"key":"{key}"}}}}"#
         );
-        assert!(line.contains("u0030"));
         let responses = run_lines(line.as_bytes());
         let text = message(&responses[0]);
-        assert!(text.contains("escape sequences"), "{text}");
-        assert!(!text.contains("0030"), "{text}");
+        assert!(text.contains("without escape sequences"), "{text}");
+        assert!(!text.contains("ec2e7") && !text.contains("abab"), "{text}");
+        // So is a key that isn't a string at all.
+        let not_a_string =
+            br#"{"command":"add_key","parameters":{"camera":"cam1","key_id":1,"key":5}}"#;
+        let text = message(&run_lines(not_a_string)[0]).to_owned();
+        assert!(text.contains("keys must be plain strings of hex"), "{text}");
     }
 
     /// A reader that fails once with its error, then reports end of input.
@@ -607,38 +723,45 @@ mod tests {
 
     #[test]
     fn a_non_string_frame_names_what_was_expected() {
-        let mut session = Session::default();
+        let mut session: Session = Session::default();
         let response = serde_json::to_value(
             session.handle_line(br#"{"command":"receive","parameters":{"frame":5}}"#),
         )
         .unwrap();
         let text = response["payload"]["message"].as_str().unwrap();
-        assert!(text.contains("expected a hex string"), "{text}");
+        assert!(text.contains("expected a string"), "{text}");
     }
 
     #[test]
-    fn abbreviates_long_names() {
-        assert_eq!(abbreviate("short"), "short");
-        assert_eq!(abbreviate(&"x".repeat(32)), "x".repeat(32));
+    fn a_number_given_as_a_string_is_not_quoted() {
+        let line = br#"{"command":"revoke_key","parameters":{"camera":"cam1","key_id":"300"}}"#;
+        let text = message(&run_lines(line)[0]).to_owned();
+        assert!(
+            text.starts_with("invalid command: invalid type: a string, expected a whole number"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn truncates_by_characters() {
+        assert_eq!(truncate("short", 32), "short");
+        assert_eq!(truncate(&"x".repeat(32), 32), "x".repeat(32));
         let long = "x".repeat(100);
-        assert_eq!(abbreviate(&long), format!("{}...", "x".repeat(32)));
+        assert_eq!(truncate(&long, 32), format!("{}...", "x".repeat(32)));
         // Counts characters, not bytes.
         assert_eq!(
-            abbreviate(&"é".repeat(40)),
+            truncate(&"é".repeat(40), 32),
             format!("{}...", "é".repeat(32))
         );
     }
 
     #[test]
-    fn json_errors_quoting_input_are_capped() {
-        let mut session = Session::default();
+    fn json_errors_naming_an_unknown_field_are_capped() {
+        let mut session: Session = Session::default();
         let long = "y".repeat(10_000);
         let unknown_field = format!(r#"{{"command":"get_state","parameters":{{}},"{long}":1}}"#);
-        let escaped_command = format!(
-            r#"{{"command":"get{}u005fstate{long}","parameters":{{}}}}"#,
-            char::from(0x5c_u8)
-        );
-        for line in [unknown_field, escaped_command] {
+        let unknown_parameter = format!(r#"{{"command":"get_state","parameters":{{"{long}":1}}}}"#);
+        for line in [unknown_field, unknown_parameter] {
             let response = serde_json::to_value(session.handle_line(line.as_bytes())).unwrap();
             let message = response["payload"]["message"].as_str().unwrap();
             assert!(message.starts_with("invalid command: "), "{message}");

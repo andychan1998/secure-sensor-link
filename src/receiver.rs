@@ -4,7 +4,8 @@
 //! documented order and computes every result without changing anything, and
 //! then `Receiver::commit`, which first writes to storage whatever must
 //! survive a restart, then applies the plan to memory with steps that can't
-//! fail. A rejected frame, or a failed storage write, changes nothing. Key
+//! fail. A rejected frame, or a failed storage write, changes nothing, with
+//! one exception after a restart (`Decision::BelowRestartFloor`). Key
 //! management (`add_key`, `revoke_key`) follows the same pattern.
 //!
 //! The receiver owns its storage. A restart ([`Receiver::restart`]) throws away

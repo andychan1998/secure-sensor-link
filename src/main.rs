@@ -3,8 +3,12 @@
 use std::io;
 use std::process::ExitCode;
 
+use secure_sensor_link::input::ErasingReader;
+
 fn main() -> ExitCode {
-    let input = io::stdin().lock();
+    // Read through a buffer that is erased as it goes, so key text from the
+    // input doesn't stay in the standard library's stdin buffer.
+    let input = ErasingReader::new(io::stdin().lock());
     let output = io::stdout().lock();
     match secure_sensor_link::protocol::run(input, output) {
         Ok(()) => ExitCode::SUCCESS,
