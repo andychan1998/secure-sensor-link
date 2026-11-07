@@ -1,0 +1,62 @@
+[package]
+name = "secure-sensor-link"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Receiver that decodes, authenticates and time-synchronizes camera frames arriving over a hostile link"
+publish = false
+
+# Runtime dependencies are limited by the project rules to a JSON library, a hex
+# library and a vetted HMAC-SHA256 library. The `zeroize` features belong to the
+# HMAC library: they erase hash state (which is derived from the key) on drop and
+# give us the library's own volatile-write erasure for key bytes.
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+hex = "0.4.3"
+hmac = { version = "0.13.0", features = ["zeroize"] }
+sha2 = { version = "0.11.1", default-features = false, features = ["zeroize"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Nothing in the receiver may panic on any input: no unwrap/expect, no slice
+# indexing, no explicit panics. Tests are exempt (see clippy.toml).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+# No overflow of any kind: every integer operation is checked, every conversion
+# is a checked one (no `as`).
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+cast_lossless = "deny"
+# Output only goes through the protocol writer.
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+exit = "deny"
+mem_forget = "deny"
+module_name_repetitions = "allow"
+
+[profile.release]
+# Keep integer overflow checks in release builds as a backstop to the lints.
+overflow-checks = true
+# The per-command panic safety net relies on unwinding.
+panic = "unwind"

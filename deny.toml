@@ -1,0 +1,24 @@
+# cargo-deny: checks every dependency for known vulnerabilities, unexpected
+# licenses and unexpected sources. Run with `cargo deny check`.
+
+[advisories]
+# Fail on any crate with a security advisory, or a yanked release.
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+
+# This crate itself isn't published, so it needs no license entry.
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io; no git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
