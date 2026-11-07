@@ -257,12 +257,16 @@ fn read_line<R: BufRead>(input: &mut R, buf: &mut Vec<u8>) -> io::Result<Line> {
     }
 }
 
+/// Writes one response line. The whole line is built first and written at
+/// once, so a failed write never leaves part of a response followed by
+/// another.
 fn write_response<W: Write>(output: &mut W, response: &Response) -> io::Result<()> {
-    if serde_json::to_writer(&mut *output, response).is_err() {
-        // Can't happen for these types; still, keep one line per command.
-        output.write_all(br#"{"status":"error","payload":{"message":"internal error"}}"#)?;
-    }
-    output.write_all(b"\n")?;
+    // Serializing these types can't fail; still, keep one line per command.
+    let mut line = serde_json::to_vec(response).unwrap_or_else(|_| {
+        br#"{"status":"error","payload":{"message":"internal error"}}"#.to_vec()
+    });
+    line.push(b'\n');
+    output.write_all(&line)?;
     output.flush()
 }
 
@@ -566,36 +570,24 @@ mod tests {
         assert!(!text.contains("0030"), "{text}");
     }
 
-    /// Input that fails once with `kind`, then yields `data`.
-    struct Flaky {
-        failure: Option<ErrorKind>,
-        data: io::Cursor<Vec<u8>>,
-    }
+    /// A reader that fails once with its error, then reports end of input.
+    struct FailOnce(Option<ErrorKind>);
 
-    impl io::Read for Flaky {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            io::Read::read(&mut self.data, buf)
-        }
-    }
-
-    impl BufRead for Flaky {
-        fn fill_buf(&mut self) -> io::Result<&[u8]> {
-            match self.failure.take() {
+    impl io::Read for FailOnce {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.take() {
                 Some(kind) => Err(io::Error::from(kind)),
-                None => self.data.fill_buf(),
+                None => Ok(0),
             }
         }
-
-        fn consume(&mut self, amount: usize) {
-            self.data.consume(amount);
-        }
     }
 
-    fn flaky(kind: ErrorKind) -> Flaky {
-        Flaky {
-            failure: Some(kind),
-            data: io::Cursor::new(b"{}\n".to_vec()),
-        }
+    /// Input whose first read fails with `kind`, then yields one line.
+    fn flaky(kind: ErrorKind) -> impl BufRead {
+        io::BufReader::new(io::Read::chain(
+            FailOnce(Some(kind)),
+            io::Cursor::new(b"{}\n".to_vec()),
+        ))
     }
 
     #[test]
@@ -653,5 +645,57 @@ mod tests {
             assert!(message.ends_with("yyy..."), "{message}");
             assert_eq!(message.chars().count(), "invalid command: ".len() + 200 + 3);
         }
+    }
+
+    #[test]
+    fn messages_for_errors_not_shown_elsewhere() {
+        assert_eq!(
+            CommandError::Init(StorageError::WriteFailed).to_string(),
+            "storage write failed: not initialized"
+        );
+        assert_eq!(
+            CommandError::Restart(StorageError::NothingSaved).to_string(),
+            "storage holds no saved state: restart failed"
+        );
+        assert_eq!(CommandError::Internal.to_string(), "internal error");
+    }
+
+    #[test]
+    fn a_failed_write_ends_the_run_without_writing_anything_more() {
+        /// Accepts `room` bytes, fails once, then accepts everything.
+        struct Glitchy {
+            written: Vec<u8>,
+            room: usize,
+        }
+        impl Write for Glitchy {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.room == 0 {
+                    self.room = usize::MAX;
+                    return Err(io::Error::from(ErrorKind::StorageFull));
+                }
+                let n = buf.len().min(self.room);
+                self.written.extend_from_slice(&buf[..n]);
+                self.room -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut one_response = Vec::new();
+        run(&b"{}\n"[..], &mut one_response).unwrap();
+        // Room for the first response and the start of the second.
+        let mut output = Glitchy {
+            written: Vec::new(),
+            room: one_response.len() + 10,
+        };
+        let error = run(&b"{}\n{}\n{}\n"[..], &mut output).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::StorageFull);
+        // The first response whole, then the start of the second and nothing
+        // after it: no fallback message glued onto the partial line, and no
+        // third response.
+        let mut expected = one_response;
+        expected.extend_from_slice(br#"{"status":"#);
+        assert_eq!(output.written, expected);
     }
 }

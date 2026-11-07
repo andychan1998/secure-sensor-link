@@ -385,4 +385,20 @@ mod tests {
             Err(TreeError::TrailingBytes { count: 2 })
         );
     }
+
+    #[test]
+    fn messages_for_errors_not_shown_elsewhere() {
+        assert_eq!(
+            TreeError::TrailingBytes { count: 3 }.to_string(),
+            "3 bytes follow the tree"
+        );
+        assert_eq!(
+            TreeError::TooManyNodes.to_string(),
+            format!("tree has more than {MAX_NODES} nodes")
+        );
+        assert_eq!(
+            TreeError::Internal.to_string(),
+            "internal error while decoding the tree"
+        );
+    }
 }

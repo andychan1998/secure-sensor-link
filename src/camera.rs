@@ -98,14 +98,6 @@ impl<T> PerCamera<T> {
         }
     }
 
-    /// Mutable access to one camera's value and the other camera's value at once.
-    pub const fn this_and_other_mut(&mut self, camera: Camera) -> (&mut T, &mut T) {
-        match camera {
-            Camera::Cam1 => (&mut self.cam1, &mut self.cam2),
-            Camera::Cam2 => (&mut self.cam2, &mut self.cam1),
-        }
-    }
-
     /// The two values, cam1's first.
     pub fn into_parts(self) -> (T, T) {
         (self.cam1, self.cam2)
@@ -140,12 +132,11 @@ mod tests {
     }
 
     #[test]
-    fn per_camera_lookups_and_split_borrows() {
+    fn per_camera_lookups_and_serialization() {
         let mut values = PerCamera::new(1, 2);
         assert_eq!(*values.get(Camera::Cam2), 2);
-        let (this, other) = values.this_and_other_mut(Camera::Cam2);
-        *this = 20;
-        *other = 10;
+        *values.get_mut(Camera::Cam2) = 20;
+        *values.get_mut(Camera::Cam1) = 10;
         assert_eq!(values, PerCamera::new(10, 20));
         assert_eq!(
             serde_json::to_string(&values).unwrap(),

@@ -660,11 +660,12 @@ mod tests {
     }
 
     #[test]
-    fn storage_error_messages_say_what_did_not_happen() {
+    fn messages_for_errors_not_shown_elsewhere() {
         assert_eq!(
             ReceiveError::Storage(StorageError::WriteFailed).to_string(),
             "storage write failed: frame not accepted"
         );
+        assert_eq!(ReceiveError::Internal.to_string(), "internal error");
         assert_eq!(
             KeyCommandError::Storage(StorageError::WriteFailed).to_string(),
             "storage write failed: keys not changed"

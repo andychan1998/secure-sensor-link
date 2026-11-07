@@ -222,4 +222,12 @@ mod tests {
             assert_eq!(Config::new(bad).unwrap_err().to_string(), message);
         }
     }
+
+    #[test]
+    fn the_internal_error_message() {
+        assert_eq!(
+            ConfigError::Internal.to_string(),
+            "internal error while reading the configuration"
+        );
+    }
 }

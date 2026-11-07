@@ -1,0 +1,52 @@
+# Fuzz targets, run with cargo-fuzz (needs the nightly toolchain):
+#   cargo +nightly fuzz run <target>
+# A separate crate, so the receiver itself never depends on libfuzzer-sys.
+
+[package]
+name = "secure-sensor-link-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+secure-sensor-link = { path = ".." }
+hex = "0.4.3"
+hmac = "0.13.0"
+serde_json = "1.0.154"
+sha2 = { version = "0.11.1", default-features = false }
+
+# Fuzz with overflow checks and debug assertions on, as release builds of the
+# receiver run.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+# Keeps this crate out of the receiver's own workspace and lock file.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "command_line"
+path = "fuzz_targets/command_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "receiver"
+path = "fuzz_targets/receiver.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree"
+path = "fuzz_targets/tree.rs"
+test = false
+doc = false
+bench = false

@@ -154,8 +154,6 @@ impl<'a> RawFrame<'a> {
         mac.verify_slice(self.tag)
             .map_err(|_| FrameError::AuthenticationFailed(self.camera))?;
         Ok(VerifiedFrame {
-            camera: self.camera,
-            key_id: self.key_id,
             seq: self.seq,
             timestamp: self.timestamp,
             payload: self.payload,
@@ -163,27 +161,16 @@ impl<'a> RawFrame<'a> {
     }
 }
 
-/// A frame whose tag matched its camera's key.
+/// A frame whose tag matched its camera's key. Its camera and key id were
+/// read from the [`RawFrame`] to pick the key, and are covered by the tag.
 #[derive(Debug)]
 pub struct VerifiedFrame<'a> {
-    camera: Camera,
-    key_id: KeyId,
     seq: u32,
     timestamp: i64,
     payload: &'a [u8],
 }
 
 impl<'a> VerifiedFrame<'a> {
-    #[must_use]
-    pub const fn camera(&self) -> Camera {
-        self.camera
-    }
-
-    #[must_use]
-    pub const fn key_id(&self) -> KeyId {
-        self.key_id
-    }
-
     #[must_use]
     pub const fn seq(&self) -> u32 {
         self.seq
@@ -419,7 +406,6 @@ mod tests {
         assert_eq!(raw.camera(), Camera::Cam1);
         assert_eq!(raw.key_id(), KeyId(1));
         let frame = raw.verify(&Key::from_hex(KEY1_ID1).unwrap()).unwrap();
-        assert_eq!(frame.key_id(), KeyId(1));
         assert_eq!(frame.seq(), 5);
         assert_eq!(frame.timestamp(), 1200);
         assert_eq!(frame.payload(), &[1, 0, 0, 0, 5, 0, 0]);
@@ -436,7 +422,7 @@ mod tests {
         let bytes = decode_hex(SPEC_FRAME).unwrap();
         let raw = RawFrame::parse(&bytes).unwrap();
         assert_eq!(raw.key_id(), KeyId(0));
-        assert_eq!(raw.verify(&key1()).unwrap().key_id(), KeyId(0));
+        assert_eq!(raw.verify(&key1()).unwrap().seq(), 1);
     }
 
     #[test]
@@ -492,5 +478,19 @@ mod tests {
         let frame = RawFrame::parse(&bytes).unwrap().verify(&key1()).unwrap();
         assert_eq!(frame.seq(), u32::MAX);
         assert_eq!(frame.timestamp(), i64::MIN);
+    }
+
+    #[test]
+    fn messages_for_errors_not_shown_elsewhere() {
+        assert_eq!(
+            FrameError::HexTooLong { len: 200_000 }.to_string(),
+            format!(
+                "malformed frame: 200000 hex characters is more than the {MAX_FRAME_HEX_LEN} maximum"
+            )
+        );
+        assert_eq!(
+            FrameError::Internal.to_string(),
+            "internal error while reading the frame"
+        );
     }
 }

@@ -72,3 +72,22 @@ fn a_huge_line_without_a_newline_gets_one_error() {
 fn empty_input_exits_cleanly_with_no_output() {
     assert!(run(b"").is_empty());
 }
+
+#[test]
+fn a_closed_stdout_ends_the_run_with_an_error() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_secure-sensor-link"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Nobody will read the responses.
+    drop(child.stdout.take());
+    let input = format!("{GET_STATE}\n").repeat(1000);
+    // The receiver may stop reading as soon as its first write fails.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("secure-sensor-link: "), "{stderr}");
+}

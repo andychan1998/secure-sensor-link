@@ -105,6 +105,7 @@ fn layout_errors_name_the_problem() {
         h.error(&receive_line("abc")),
         "malformed frame: odd number of hex characters (3)"
     );
+    assert_eq!(h.error(&receive_line("")), "malformed frame: empty frame");
     assert_eq!(
         h.error(&receive_line("zz")),
         "malformed frame: not valid hex"

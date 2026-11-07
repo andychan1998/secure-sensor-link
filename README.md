@@ -69,13 +69,51 @@ Transcripts are plain text: `> ` starts a command, and the next line is its expe
 
 ### Checking the tests themselves
 
-```
-cargo install cargo-mutants cargo-llvm-cov cargo-deny
-rustup component add llvm-tools-preview
+Passing tests only matter if they would fail on a bug. Four tools check that. CI runs coverage, a short fuzz of each target and the dependency check on every push; mutation testing takes longer, so run it after larger changes.
 
-cargo mutants               # makes small changes to the code and checks the tests catch each one
-cargo llvm-cov              # line and region coverage
-cargo deny check            # known vulnerabilities, licenses and sources of every dependency
+**Coverage**: which lines the tests run.
+
+```
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+cargo llvm-cov --summary-only            # a table per file
+cargo llvm-cov --html --open             # each line, in the browser
+```
+
+About 99% of lines run. The rest is the fallback for a response that fails to serialize, which these types can't do.
+
+**Mutation testing**: makes small changes to the code (flips a `<`, deletes a line, returns a default) and checks that a test fails for each one.
+
+```
+cargo install cargo-mutants
+cargo mutants                            # about 10 minutes
+```
+
+Every change that compiles is caught. The few that can't change behavior are listed with reasons in `.cargo/mutants.toml`.
+
+**Fuzzing**: feeds generated inputs for as long as you let it, steering toward inputs that reach new code. It needs Rust's nightly toolchain, used only for fuzzing.
+
+```
+rustup toolchain install nightly
+cargo install cargo-fuzz
+fuzz/run.sh command_line                 # 10 minutes; add a number of seconds to change that
+fuzz/run.sh receiver
+fuzz/run.sh tree
+```
+
+| Target | Feeds | Checks |
+|---|---|---|
+| `command_line` | Any input lines, after a valid `init`, starting from the spec's commands and using the protocol's words (`fuzz/seeds`, `fuzz/command_line.dict`) | Every line gets one well-formed response with a short message; no internal error; never halted |
+| `receiver` | Correctly signed frames (random ones never pass the tag) in any order, with forgeries, key commands and restarts | No seq accepted twice from a camera, across restarts; no frame accepted on a revoked key, or on a key below one already used; queues stay within `max_pending`; storage writes within budget; no internal error |
+| `tree` | Any payload bytes | Decoded trees are within the limits, and rebuilding one from its level-order output and encoding it again gives back exactly the input |
+
+A failing input is saved in `fuzz/artifacts/<target>/`; `cargo +nightly fuzz run <target> <file>` replays it.
+
+**Dependencies**: known vulnerabilities, licenses and sources of every dependency.
+
+```
+cargo install cargo-deny
+cargo deny check
 ```
 
 ## Layout
@@ -96,6 +134,7 @@ src/
   sync.rs       per-camera queues and pairing
   camera.rs     the two cameras, and one value per camera
 tests/          transcripts, rules, keys, restarts, reference model, command line
+fuzz/           fuzz targets, seeds and dictionary (a separate crate)
 ```
 
 The build denies `unsafe` code, panicking calls, slice indexing, unchecked arithmetic and `as` conversions outside tests (see `Cargo.toml`), and release builds keep overflow checks on.
