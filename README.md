@@ -36,6 +36,8 @@ demo/run.sh --all    # the whole session at once
 
 It plays `demo/session.txt` through the receiver: normal traffic, attacks on the link, key rotation and revocation, and a power loss, using the frames from the project description's examples. The transcript test checks every response in that file, so the demo can't drift from what the receiver does.
 
+Transcripts, the demo session included, are plain text: `# ` lines are comments, `> ` starts a command, and the next line is its expected response (`< ` exact, `<~ ` partial). To add a test, drop a `.txt` file in `tests/transcripts/`.
+
 ## Test
 
 ### Tests
@@ -52,7 +54,7 @@ It plays `demo/session.txt` through the receiver: normal traffic, attacks on the
 | Reference model, `tests/model.rs` | `cargo test --test model` | Property tests: random command sequences get exactly the responses of a separate, plain implementation of the spec, and random lines and frame bytes never cause an internal error | Yes |
 | Safety net, `tests/safety_net.rs` | `cargo test --test safety_net` | A storage fault in the middle of a command halts the receiver, and a restart recovers it | Yes |
 | Command line, `tests/cli.rs` | `cargo test --test cli` | The real binary over stdin and stdout | Yes |
-| Keys in memory, `tests/memory.rs` | `cargo test --test memory`, on Linux only | No copy of a retired or revoked key, and no key text, is left in the running receiver's memory | Yes, on Linux |
+| Keys in memory, `tests/memory.rs` | `cargo test --test memory`<br>Linux only: it reads the receiver's memory through `/proc/<pid>/mem`, which macOS doesn't have, so on a Mac `cargo test` skips it | No copy of a retired or revoked key, and no key text, is left in the running receiver's memory | Yes, on Linux |
 | Soak, `tests/soak.rs` | `cargo test --test soak` | A long mixed stream through the real binary: every command gets the right kind of response within 10 seconds, memory stays flat after warming up, and it reports commands per second | Yes: 5,000 commands in debug builds, 50,000 in release |
 
 ### Tools that check the tests
@@ -63,7 +65,7 @@ These check that the tests would catch a bug, and that the dependencies are soun
 |---|---|---|---|---|
 | Coverage | `rustup component add llvm-tools-preview`<br>`cargo install cargo-llvm-cov` | `cargo llvm-cov --summary-only`, or `cargo llvm-cov --html --open` to see each line | Which lines the tests run; expect about 99% | Yes |
 | Mutation testing | `cargo install cargo-mutants` | `cargo mutants` | That every small change to the code (a flipped `<`, a deleted line) makes a test fail; the exceptions, each with a reason, are in `.cargo/mutants.toml` | No: it takes about 10 minutes |
-| Fuzzing | `rustup toolchain install nightly` (used only for fuzzing)<br>`cargo install cargo-fuzz` | `fuzz/run.sh <target> [seconds]` | Generated input for the `command_line`, `receiver` and `tree` targets, for as long as you let it (10 minutes by default): no crash, and the invariants hold | Yes: 60 seconds per target |
+| Fuzzing | `rustup toolchain install nightly` (used only for fuzzing)<br>`cargo install cargo-fuzz` | `fuzz/run.sh <target> [seconds]`<br>A failing input is saved in `fuzz/artifacts/<target>/`; replay it with `cargo +nightly fuzz run <target> <file>` | Generated input for the `command_line`, `receiver` and `tree` targets, for as long as you let it (10 minutes by default): no crash, and the invariants hold | Yes: 60 seconds per target |
 | Dependencies | `cargo install cargo-deny` | `cargo deny check` | Known vulnerabilities, licenses and sources of every dependency, and that the receiver uses only the libraries the spec allows (the allowlist in `deny.toml`) | Yes |
 
 ### CI
@@ -81,12 +83,6 @@ fuzz/run.sh receiver 3600                                                # secon
 ```
 
 **Property tests and fuzzing.** Both use random input. A property test builds realistic command sequences from a recipe, checks a rule against every one, and when one fails, shrinks it to the smallest sequence that still fails. Fuzzing mutates raw bytes for as long as you let it, steering toward input that reaches new code.
-
-**Why `tests/memory.rs` runs only on Linux.** It reads the running receiver's memory through `/proc/<pid>/mem`, which only Linux has. On macOS, reading another process's memory needs root or a debugging entitlement, and system calls that the crate's ban on `unsafe` code rules out. On a Mac, `cargo test` skips it.
-
-**Transcripts** are plain text: `> ` starts a command, and the next line is its expected response (`< ` exact, `<~ ` partial). To add a test, drop a `.txt` file in `tests/transcripts/`.
-
-A failing fuzz input is saved in `fuzz/artifacts/<target>/`; `cargo +nightly fuzz run <target> <file>` replays it.
 
 ## Layout
 
