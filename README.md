@@ -38,7 +38,9 @@ It plays `demo/session.txt` through the receiver: normal traffic, attacks on the
 
 ## Test
 
-`cargo test` runs every test in the first ten rows, in a few seconds. The last four rows are tools that check the tests themselves; each needs a one-time setup first.
+### Tests
+
+`cargo test` runs all of these, in a few seconds.
 
 | Test | Run with | What it checks | In CI |
 |---|---|---|---|
@@ -52,12 +54,23 @@ It plays `demo/session.txt` through the receiver: normal traffic, attacks on the
 | Command line, `tests/cli.rs` | `cargo test --test cli` | The real binary over stdin and stdout | Yes |
 | Keys in memory, `tests/memory.rs` | `cargo test --test memory`, on Linux only | No copy of a retired or revoked key, and no key text, is left in the running receiver's memory | Yes, on Linux |
 | Soak, `tests/soak.rs` | `cargo test --test soak` | A long mixed stream through the real binary: every command gets the right kind of response within 10 seconds, memory stays flat after warming up, and it reports commands per second | Yes: 5,000 commands in debug builds, 50,000 in release |
+
+### Tools that check the tests
+
+These check that the tests would catch a bug, and that the dependencies are sound. Each needs a one-time setup first.
+
+| Tool | Run with | What it checks | In CI |
+|---|---|---|---|
 | Coverage | One-time setup: `rustup component add llvm-tools-preview` and `cargo install cargo-llvm-cov`<br>Then: `cargo llvm-cov --summary-only`, or `cargo llvm-cov --html --open` to see each line | Which lines the tests run; expect about 99% | Yes |
 | Mutation testing | One-time setup: `cargo install cargo-mutants`<br>Then: `cargo mutants` | That every small change to the code (a flipped `<`, a deleted line) makes a test fail; the exceptions, each with a reason, are in `.cargo/mutants.toml` | No: it takes about 10 minutes |
 | Fuzzing | One-time setup: `rustup toolchain install nightly` (used only for fuzzing) and `cargo install cargo-fuzz`<br>Then: `fuzz/run.sh <target> [seconds]` | Generated input for the `command_line`, `receiver` and `tree` targets, for as long as you let it (10 minutes by default): no crash, and the invariants hold | Yes: 60 seconds per target |
 | Dependencies | One-time setup: `cargo install cargo-deny`<br>Then: `cargo deny check` | Known vulnerabilities, licenses and sources of every dependency, and that the receiver uses only the libraries the spec allows (the allowlist in `deny.toml`) | Yes |
 
+### CI
+
 CI runs on every push and pull request (`.github/workflows/ci.yml`). It runs the tests on Linux and on macOS, each as a debug and a release build, and also checks formatting (`cargo fmt --check`), lints (`cargo clippy`) and the docs (`cargo doc`).
+
+### Notes
 
 **Longer runs.** The property tests, the soak test and fuzzing all take a size:
 
