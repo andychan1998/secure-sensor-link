@@ -48,80 +48,53 @@ It plays `demo/session.txt` through the receiver: normal traffic, attacks on the
 
 ## Test
 
+`cargo test` runs every test in the first ten rows, in a few seconds. The last four rows are tools that check the tests themselves.
+
+| Test | Run with | What it checks | In CI |
+|---|---|---|---|
+| Unit tests, `src/*.rs` | `cargo test --lib` | Each module, including every boundary value | Yes |
+| Spec examples, `tests/transcripts.rs` | `cargo test --test transcripts` | The project description's three examples, response by response, and the demo session | Yes |
+| Rules, `tests/rules.rs` | `cargo test --test rules` | The order of checks, input rules, error messages, extreme values, and the choices for the spec's open questions on tree limits, rejected payloads and wide pair windows | Yes |
+| Keys, `tests/keys.rs` | `cargo test --test keys` | Key rotation, retirement and revocation, and each `add_key` and `revoke_key` error | Yes |
+| Restarts, `tests/restart.rs` | `cargo test --test restart` | Each restart rule and the storage write counts, plus a property test: a receiver that restarts never accepts a frame that a twin which never restarts rejects | Yes |
+| Reference model, `tests/model.rs` | `cargo test --test model` | Property tests: random command sequences get exactly the responses of a separate, plain implementation of the spec, and random lines and frame bytes never cause an internal error | Yes |
+| Safety net, `tests/safety_net.rs` | `cargo test --test safety_net` | A storage fault in the middle of a command halts the receiver, and a restart recovers it | Yes |
+| Command line, `tests/cli.rs` | `cargo test --test cli` | The real binary over stdin and stdout | Yes |
+| Keys in memory, `tests/memory.rs` | `cargo test --test memory`, on Linux only | No copy of a retired or revoked key, and no key text, is left in the running receiver's memory | Yes, on Linux |
+| Soak, `tests/soak.rs` | `cargo test --test soak` | A long mixed stream through the real binary: every command gets the right kind of response within 10 seconds, memory stays flat after warming up, and it reports commands per second | Yes: 5,000 commands in debug builds, 50,000 in release |
+| Coverage | `cargo llvm-cov --summary-only` | Which lines the tests run; expect about 99% | Yes |
+| Mutation testing | `cargo mutants` | That every small change to the code (a flipped `<`, a deleted line) makes a test fail; the exceptions, each with a reason, are in `.cargo/mutants.toml` | No: it takes about 10 minutes |
+| Fuzzing | `fuzz/run.sh <target> [seconds]` | Generated input for the `command_line`, `receiver` and `tree` targets, for as long as you let it (10 minutes by default): no crash, and the invariants hold | Yes: 60 seconds per target |
+| Dependencies | `cargo deny check` | Known vulnerabilities, licenses and sources of every dependency, and that the receiver uses only the libraries the spec allows (the allowlist in `deny.toml`) | Yes |
+
+CI runs on every push and pull request (`.github/workflows/ci.yml`). It runs the tests on Linux and on macOS, each as a debug and a release build, and also checks formatting (`cargo fmt --check`), lints (`cargo clippy`) and the docs (`cargo doc`).
+
+**Longer runs.** The property tests, the soak test and fuzzing all take a size:
+
 ```
-cargo test                  # everything, a few seconds
-cargo test --test rules     # the receiver's rules
-cargo test --test keys      # key rotation and revocation
-cargo test --test restart   # restarts
-cargo test --test model     # random command sequences against a reference model
-cargo test --test soak      # a long mixed stream through the real binary
+PROPTEST_CASES=100000 cargo test --release --test model                  # random cases per property test (default 400)
+SOAK_COMMANDS=1000000 cargo test --release --test soak -- --nocapture   # commands; prints commands per second
+fuzz/run.sh receiver 3600                                                # seconds of fuzzing
 ```
 
-Transcripts are plain text: `> ` starts a command, and the next line is its expected response (`< ` exact, `<~ ` partial). To add a test, drop a `.txt` file in `tests/transcripts/`.
+**Property tests and fuzzing.** Both use random input. A property test builds realistic command sequences from a recipe, checks a rule against every one, and when one fails, shrinks it to the smallest sequence that still fails. Fuzzing mutates raw bytes for as long as you let it, steering toward input that reaches new code.
 
-**Linux only: `tests/memory.rs`.** It checks that no copy of a retired or revoked key is left behind by reading the running receiver's memory through `/proc/<pid>/mem`, which only Linux has. On macOS, reading another process's memory needs root or a debugging entitlement, and system calls that the crate's ban on `unsafe` code rules out. On a Mac, `cargo test` skips it; CI runs it on Linux.
+**Why `tests/memory.rs` runs only on Linux.** It reads the running receiver's memory through `/proc/<pid>/mem`, which only Linux has. On macOS, reading another process's memory needs root or a debugging entitlement, and system calls that the crate's ban on `unsafe` code rules out. On a Mac, `cargo test` skips it.
 
-**Property tests: `tests/model.rs` and part of `tests/restart.rs`.** Instead of fixed examples, they generate random command sequences (valid, forged, replayed and malformed frames, key changes, restarts) and check that a rule holds for every one, such as "the receiver gives exactly the responses of a plain reference implementation". A failing sequence is shrunk to the smallest one that still fails. `cargo test` runs 400 to 500 sequences each; for a longer run, raise the count:
+**Transcripts** are plain text: `> ` starts a command, and the next line is its expected response (`< ` exact, `<~ ` partial). To add a test, drop a `.txt` file in `tests/transcripts/`.
 
-```
-PROPTEST_CASES=100000 cargo test --release --test model
-```
-
-**Soak test: `tests/soak.rs`.** Sends a long mixed stream of frames, forgeries, replays, bad lines, key changes and restarts through the real binary. It checks that every command gets the right kind of response within 10 seconds and that memory stops growing after warming up, and prints commands per second. `cargo test` sends 5,000 commands in debug builds and 50,000 in release; for a stress run:
-
-```
-SOAK_COMMANDS=1000000 cargo test --release --test soak -- --nocapture
-```
-
-## What CI runs
-
-On every push and pull request (`.github/workflows/ci.yml`):
-
-| Job | Runs |
-|---|---|
-| Test, on Linux and on macOS | `cargo fmt --check`, `cargo clippy`, `cargo doc`, then every test twice: `cargo test` and `cargo test --release` (`tests/memory.rs` on Linux only) |
-| Coverage, on Linux | every test again, measuring which lines run |
-| Fuzz, on Linux | each fuzz target for 60 seconds |
-| Dependencies | `cargo deny check` |
-
-Mutation testing takes about 10 minutes, so it isn't in CI; run it after larger changes.
-
-## Check the tests
-
-**Coverage**: which lines the tests run. Expect about 99% of lines.
+**Installing the tools:**
 
 ```
 rustup component add llvm-tools-preview
-cargo install cargo-llvm-cov
-cargo llvm-cov --summary-only            # a table per file
-cargo llvm-cov --html --open             # each line, in the browser
-```
-
-**Mutation testing**: makes small changes to the code and checks that a test fails for each one. Expect every mutant to be caught; the exclusions, each with a reason, are in `.cargo/mutants.toml`.
-
-```
-cargo install cargo-mutants
-cargo mutants                            # about 10 minutes
-```
-
-**Fuzzing**: random input too, but unlike the property tests it mutates raw bytes for as long as you let it, steering toward input that reaches new code, and runs outside `cargo test`. It needs Rust's nightly toolchain, used only for fuzzing.
-
-```
-rustup toolchain install nightly
+cargo install cargo-llvm-cov                # coverage; cargo llvm-cov --html --open shows each line
+cargo install cargo-mutants                 # mutation testing
+rustup toolchain install nightly            # fuzzing needs nightly, used for nothing else
 cargo install cargo-fuzz
-fuzz/run.sh command_line                 # 10 minutes; add a number of seconds to change that
-fuzz/run.sh receiver
-fuzz/run.sh tree
+cargo install cargo-deny                    # dependency checks
 ```
 
-A failing input is saved in `fuzz/artifacts/<target>/`; `cargo +nightly fuzz run <target> <file>` replays it.
-
-**Dependencies**: checks every dependency for known vulnerabilities, its license and where it comes from, and that the receiver uses only the libraries the spec allows (the allowlist in `deny.toml`).
-
-```
-cargo install cargo-deny
-cargo deny check
-```
+A failing fuzz input is saved in `fuzz/artifacts/<target>/`; `cargo +nightly fuzz run <target> <file>` replays it.
 
 ## Layout
 
