@@ -57,14 +57,14 @@ It plays `demo/session.txt` through the receiver: normal traffic, attacks on the
 
 ### Tools that check the tests
 
-These check that the tests would catch a bug, and that the dependencies are sound. Each needs a one-time setup first.
+These check that the tests would catch a bug, and that the dependencies are sound. Run each tool's one-time setup before its first use.
 
-| Tool | Run with | What it checks | In CI |
-|---|---|---|---|
-| Coverage | One-time setup: `rustup component add llvm-tools-preview` and `cargo install cargo-llvm-cov`<br>Then: `cargo llvm-cov --summary-only`, or `cargo llvm-cov --html --open` to see each line | Which lines the tests run; expect about 99% | Yes |
-| Mutation testing | One-time setup: `cargo install cargo-mutants`<br>Then: `cargo mutants` | That every small change to the code (a flipped `<`, a deleted line) makes a test fail; the exceptions, each with a reason, are in `.cargo/mutants.toml` | No: it takes about 10 minutes |
-| Fuzzing | One-time setup: `rustup toolchain install nightly` (used only for fuzzing) and `cargo install cargo-fuzz`<br>Then: `fuzz/run.sh <target> [seconds]` | Generated input for the `command_line`, `receiver` and `tree` targets, for as long as you let it (10 minutes by default): no crash, and the invariants hold | Yes: 60 seconds per target |
-| Dependencies | One-time setup: `cargo install cargo-deny`<br>Then: `cargo deny check` | Known vulnerabilities, licenses and sources of every dependency, and that the receiver uses only the libraries the spec allows (the allowlist in `deny.toml`) | Yes |
+| Tool | One-time setup | Run with | What it checks | In CI |
+|---|---|---|---|---|
+| Coverage | `rustup component add llvm-tools-preview`<br>`cargo install cargo-llvm-cov` | `cargo llvm-cov --summary-only`, or `cargo llvm-cov --html --open` to see each line | Which lines the tests run; expect about 99% | Yes |
+| Mutation testing | `cargo install cargo-mutants` | `cargo mutants` | That every small change to the code (a flipped `<`, a deleted line) makes a test fail; the exceptions, each with a reason, are in `.cargo/mutants.toml` | No: it takes about 10 minutes |
+| Fuzzing | `rustup toolchain install nightly` (used only for fuzzing)<br>`cargo install cargo-fuzz` | `fuzz/run.sh <target> [seconds]` | Generated input for the `command_line`, `receiver` and `tree` targets, for as long as you let it (10 minutes by default): no crash, and the invariants hold | Yes: 60 seconds per target |
+| Dependencies | `cargo install cargo-deny` | `cargo deny check` | Known vulnerabilities, licenses and sources of every dependency, and that the receiver uses only the libraries the spec allows (the allowlist in `deny.toml`) | Yes |
 
 ### CI
 
