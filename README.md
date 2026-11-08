@@ -17,11 +17,15 @@ cargo build --release
 
 The receiver reads one JSON command per line on stdin and writes one JSON response per line on stdout. The commands, their parameters and their responses are defined in the project description, which isn't included in this repository; `demo/session.txt` has a worked example of each command.
 
+Start it and type or paste commands; each response prints right away. The first command must be `init`, such as this one from the project description:
+
 ```
-cargo run --release < commands.jsonl
+cargo run --release
+{"command":"init","parameters":{"period_ms":50,"max_jitter_ms":5,"pair_window_ms":20,"max_pending":4,"keys":{"cam1":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","cam2":"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"}}}
+{"command":"get_state","parameters":{}}
 ```
 
-Or start it with `cargo run --release` and type commands; each response prints right away. The first command must be `init`.
+To run a file of commands instead, one per line: `cargo run --release < FILE`.
 
 ## Demo
 
