@@ -28,7 +28,7 @@ cargo run --release
 {"command":"get_state","parameters":{}}
 ```
 
-| Command | Does |
+| Command | What it does |
 |---|---|
 | `init` | Sets the timing limits, each camera's key 0 and, optionally, `persist_interval` (default 100). Must come first, once. |
 | `receive` | Checks one frame (version 1, or version 2 with a key id) and returns it with any newly paired frames. |
@@ -144,4 +144,21 @@ src/
 tests/          transcripts, rules, keys, restarts, reference model, soak, command line
 fuzz/           fuzz targets, seeds and dictionary (a separate crate)
 demo/           the presentation demo: run.sh and the session it plays
+```
+
+## Stages
+
+The project was built in the spec's three stages, and each finished stage is tagged:
+
+| Tag | Stage | What it adds |
+|---|---|---|
+| `v1-base` | Base problem | `init`, `receive` and `get_state`: authenticated frames, replay protection, timestamp correction and pairing |
+| `v2-keys` | Follow-on 1 | Key rotation and revocation: version 2 frames with a key id, `add_key` and `revoke_key` |
+| `v3-restart` | Follow-on 2 | `restart` and `persist_interval`: replay protection that survives a restart, within the storage write budget |
+
+`main` builds on `v3-restart` with CI, fuzzing, the fixes from an independent security review, the demo and the soak test.
+
+```
+git checkout v2-keys        # look at a stage; git checkout main to come back
+git diff v1-base v2-keys    # what a stage changed
 ```
