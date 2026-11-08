@@ -15,27 +15,14 @@ cargo build --release
 
 ## Run
 
-The receiver reads one JSON command per line on stdin and writes one JSON response per line on stdout.
+The receiver reads one JSON command per line on stdin and writes one JSON response per line on stdout. The commands, their parameters and their responses are defined in the project description, which isn't included in this repository; `demo/session.txt` has a worked example of each command.
 
 ```
-cargo run --release < commands.jsonl
+cargo run --release < commands.jsonl                        # your own commands, one per line
+sed -n 's/^> //p' demo/session.txt | cargo run --release    # the demo's commands
 ```
 
-Or start it and type commands; each response prints right away:
-
-```
-cargo run --release
-{"command":"get_state","parameters":{}}
-```
-
-| Command | What it does |
-|---|---|
-| `init` | Sets the timing limits, each camera's key 0 and, optionally, `persist_interval` (default 100). Must come first, once. |
-| `receive` | Checks one frame (version 1, or version 2 with a key id) and returns it with any newly paired frames. |
-| `get_state` | Returns each camera's last frame, waiting frames and keys. |
-| `add_key` | Provisions a new key id for a camera. |
-| `revoke_key` | Revokes a key id. |
-| `restart` | Simulates a power loss, then restarts from the (simulated) non-volatile storage. |
+Or start it with `cargo run --release` and type commands; each response prints right away. The first command must be `init`.
 
 ## Demo
 

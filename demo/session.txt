@@ -97,3 +97,7 @@
 # and cam2's seq 107 pairs with it
 > {"command":"receive","parameters":{"frame":"0202010000006b00000000000018a10001009aaf101636fa22120bcd29248ce71df833c45c3670bcffca1b3199cbc47a514a"}}
 < {"status":"ok","payload":{"frame":{"camera":"cam2","key_id":1,"seq":107,"timestamp":6305,"corrected":false,"tree":[]},"synced":[{"timestamp":6302,"cam1":107,"cam2":107}]}}
+
+# the state now: each camera's last frame, nothing waiting, and the keys that survived the reboot
+> {"command":"get_state","parameters":{}}
+< {"status":"ok","payload":{"cameras":{"cam1":{"last_seq":107,"last_timestamp":6300,"pending":[],"keys":[{"key_id":0,"status":"retired"},{"key_id":1,"status":"active"}]},"cam2":{"last_seq":107,"last_timestamp":6305,"pending":[],"keys":[{"key_id":0,"status":"revoked"},{"key_id":1,"status":"active"}]}}}}
