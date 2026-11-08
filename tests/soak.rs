@@ -27,7 +27,7 @@
 mod support;
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -216,6 +216,19 @@ fn write_stream(count: u32, out: impl Write, expect: mpsc::Sender<Expect>) {
     stream.out.flush().unwrap();
 }
 
+/// The receiver under test. If the test fails part-way, the receiver is
+/// killed, so one that hangs doesn't outlive the test.
+struct Running(Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            self.0.kill().ok();
+            self.0.wait().ok();
+        }
+    }
+}
+
 /// The resident memory of process `pid` in KiB, from `ps`, which reports it the
 /// same way on Linux and macOS.
 fn resident_kib(pid: u32) -> u64 {
@@ -239,15 +252,17 @@ fn a_long_mixed_stream_gets_every_response_without_memory_growth() {
     let count: u32 = std::env::var("SOAK_COMMANDS").map_or(DEFAULT_COMMANDS, |value| {
         value.parse().expect("SOAK_COMMANDS must be a whole number")
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_secure-sensor-link"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
+    let mut child = Running(
+        Command::new(env!("CARGO_BIN_EXE_secure-sensor-link"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.0.id();
+    let stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
 
     let start = Instant::now();
     let (expect_tx, expect_rx) = mpsc::channel();
@@ -303,7 +318,7 @@ fn a_long_mixed_stream_gets_every_response_without_memory_growth() {
     }
     let elapsed = start.elapsed();
     writer.join().unwrap();
-    assert!(child.wait().unwrap().success());
+    assert!(child.0.wait().unwrap().success());
     assert!(peak <= PEAK_LIMIT_KIB, "memory peaked at {peak} KiB");
 
     eprintln!(
