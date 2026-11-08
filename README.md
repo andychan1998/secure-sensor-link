@@ -36,17 +36,17 @@ demo/run.sh --all    # the whole session at once
 
 It plays `demo/session.txt` through the receiver: normal traffic, attacks on the link, key rotation and revocation, and a power loss, using the frames from the project description's examples. The transcript test checks every response in that file, so the demo can't drift from what the receiver does.
 
-Transcripts, the demo session included, are plain text: `# ` lines are comments, `> ` starts a command, and the next line is its expected response (`< ` exact, `<~ ` partial). To add a test, drop a `.txt` file in `tests/transcripts/`.
+Transcripts, the demo session included, are plain text: `# ` lines are comments, `> ` starts a command, and the next line is its expected response: `< ` for the whole response, or `<~ ` for only the fields it lists. To add a test, drop a `.txt` file in `tests/transcripts/`.
 
 ## Test
 
 ### Tests
 
-`cargo test` runs all of these, in a few seconds.
+`cargo test` runs all of these, in about 10 seconds once built.
 
 | Test | Run with | What it checks | In CI |
 |---|---|---|---|
-| Unit tests, `src/*.rs` | `cargo test --lib` | Each module, including every boundary value | Yes |
+| Unit tests, `src/*.rs` | `cargo test --lib` | Each module, including its boundary values | Yes |
 | Spec examples, `tests/transcripts.rs` | `cargo test --test transcripts` | The project description's three examples, response by response, and the demo session | Yes |
 | Rules, `tests/rules.rs` | `cargo test --test rules` | The order of checks, input rules, error messages, extreme values, and the choices for the spec's open questions on tree limits, rejected payloads and wide pair windows | Yes |
 | Keys, `tests/keys.rs` | `cargo test --test keys` | Key rotation, retirement and revocation, and each `add_key` and `revoke_key` error | Yes |
@@ -57,16 +57,16 @@ Transcripts, the demo session included, are plain text: `# ` lines are comments,
 | Keys in memory, `tests/memory.rs` | `cargo test --test memory`<br>Linux only: it reads the receiver's memory through `/proc/<pid>/mem`, which macOS doesn't have, so on a Mac `cargo test` skips it | No copy of a retired or revoked key, and no key text, is left in the running receiver's memory | Yes, on Linux |
 | Soak, `tests/soak.rs` | `cargo test --test soak` | A long mixed stream through the real binary: every command gets the right kind of response within 10 seconds, memory stays flat after warming up, and it reports commands per second | Yes: 5,000 commands in debug builds, 50,000 in release |
 
-### Tools that check the tests
+### Tools
 
-These check that the tests would catch a bug, and that the dependencies are sound. Run each tool's one-time setup before its first use.
+Coverage and mutation testing check the tests themselves: which code they run, and whether they'd notice a change to it. Fuzzing looks for inputs the tests don't try, and the dependency check covers the libraries. Run each tool's one-time setup before its first use.
 
 | Tool | One-time setup | Run with | What it checks | In CI |
 |---|---|---|---|---|
-| Coverage | `rustup component add llvm-tools-preview`<br>`cargo install cargo-llvm-cov` | `cargo llvm-cov --summary-only`, or `cargo llvm-cov --html --open` to see each line | Which lines the tests run; expect about 99% | Yes |
+| Coverage | `rustup component add llvm-tools-preview`<br>`cargo install cargo-llvm-cov` | `cargo llvm-cov --summary-only`, or `cargo llvm-cov --html --open` to see each line | Which lines the tests run; expect about 99% | Yes: reported, with no minimum enforced |
 | Mutation testing | `cargo install cargo-mutants` | `scripts/mutants.sh`<br>It runs `cargo mutants`, passing on any options such as `-j 2`, then prints PASS or FAIL for this platform | That every small change to the code (a flipped `<`, a deleted line) makes a test fail; the exceptions, each with a reason, are in `.cargo/mutants.toml`<br>The script counts a TIMEOUT as caught: those mutants make the tests hang, and they're stopped. On macOS it lists four mutants that weaken memory erasure as not checkable there, because only `tests/memory.rs`, which runs on Linux only, can catch them | No: a full run takes about 25 minutes, less with `-j 2` |
 | Fuzzing | `rustup toolchain install nightly` (used only for fuzzing)<br>`cargo install cargo-fuzz` | `fuzz/run.sh <target> [seconds]`<br>A failing input is saved in `fuzz/artifacts/<target>/`; replay it with `cargo +nightly fuzz run <target> <file>` | Generated input for the `command_line`, `receiver` and `tree` targets, for as long as you let it (10 minutes by default): no crash, and the invariants hold | Yes: 60 seconds per target |
-| Dependencies | `cargo install cargo-deny` | `cargo deny check` | Known vulnerabilities, licenses and sources of every dependency, and that the receiver uses only the libraries the spec allows (the allowlist in `deny.toml`) | Yes |
+| Dependencies | `cargo install cargo-deny` | `cargo deny check` | Known vulnerabilities, licenses and sources of every library the receiver is built with, and that the receiver uses only the libraries the spec allows (the allowlist in `deny.toml`) | Yes |
 
 ### CI
 
@@ -88,6 +88,7 @@ fuzz/run.sh receiver 3600                                                # secon
 
 ```
 src/
+  lib.rs        the library's modules, and the order of checks for a frame
   main.rs       connects stdin and stdout to the protocol
   protocol.rs   bounded line reading, strict JSON commands, responses, panic safety net
   config.rs     init parameters, validated
@@ -102,7 +103,7 @@ src/
   timeline.rs   timestamp correction, in exact 128-bit arithmetic
   sync.rs       per-camera queues and pairing
   camera.rs     the two cameras, and one value per camera
-tests/          transcripts, rules, keys, restarts, reference model, soak, command line
+tests/          the tests in the table above, and their shared helpers in support/
 fuzz/           fuzz targets, seeds and dictionary (a separate crate)
 demo/           the presentation demo: run.sh and the session it plays
 scripts/        mutants.sh: mutation testing, with a pass or fail for this platform
