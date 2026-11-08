@@ -1,4 +1,5 @@
-//! Runs every transcript under `tests/transcripts/` through the real protocol.
+//! Runs every transcript under `tests/transcripts/`, and the demo session in
+//! `demo/session.txt`, through the real protocol.
 //!
 //! A transcript is plain text. `> ` starts a command line; the next line is its
 //! expected response: `< ` for an exact match (as JSON, so field order and
@@ -128,10 +129,11 @@ fn transcripts(dir: &Path, found: &mut Vec<PathBuf>) {
 
 #[test]
 fn all_transcripts() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/transcripts");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut found = Vec::new();
-    transcripts(&root, &mut found);
+    transcripts(&root.join("tests/transcripts"), &mut found);
     found.sort();
+    found.push(root.join("demo/session.txt"));
     assert!(!found.is_empty());
     for path in &found {
         run_transcript(path);

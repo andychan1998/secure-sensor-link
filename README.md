@@ -37,6 +37,15 @@ cargo run --release
 | `revoke_key` | Revokes a key id. |
 | `restart` | Simulates a power loss, then restarts from the (simulated) non-volatile storage. |
 
+## Demo
+
+```
+demo/run.sh          # step by step: press Enter to see each response
+demo/run.sh --all    # the whole session at once
+```
+
+It plays `demo/session.txt` through the receiver: normal traffic, attacks on the link, key rotation and revocation, and a power loss, using the frames from the project description's examples. The transcript test checks every response in that file, so the demo can't drift from what the receiver does.
+
 ## Test
 
 ```
@@ -45,15 +54,39 @@ cargo test --test rules     # the receiver's rules
 cargo test --test keys      # key rotation and revocation
 cargo test --test restart   # restarts
 cargo test --test model     # random command sequences against a reference model
+cargo test --test soak      # a long mixed stream through the real binary
 ```
-
-`tests/memory.rs` runs only on Linux.
 
 Transcripts are plain text: `> ` starts a command, and the next line is its expected response (`< ` exact, `<~ ` partial). To add a test, drop a `.txt` file in `tests/transcripts/`.
 
-## Check the tests
+**Linux only: `tests/memory.rs`.** It checks that no copy of a retired or revoked key is left behind by reading the running receiver's memory through `/proc/<pid>/mem`, which only Linux has. On macOS, reading another process's memory needs root or a debugging entitlement, and system calls that the crate's ban on `unsafe` code rules out. On a Mac, `cargo test` skips it; CI runs it on Linux.
 
-CI runs coverage, a short fuzz of each target and the dependency check on every push. Mutation testing takes longer, so run it after larger changes.
+**Property tests: `tests/model.rs` and part of `tests/restart.rs`.** Instead of fixed examples, they generate random command sequences (valid, forged, replayed and malformed frames, key changes, restarts) and check that a rule holds for every one, such as "the receiver gives exactly the responses of a plain reference implementation". A failing sequence is shrunk to the smallest one that still fails. `cargo test` runs 400 to 500 sequences each; for a longer run, raise the count:
+
+```
+PROPTEST_CASES=100000 cargo test --release --test model
+```
+
+**Soak test: `tests/soak.rs`.** Sends a long mixed stream of frames, forgeries, replays, bad lines, key changes and restarts through the real binary. It checks that every command gets the right kind of response within 10 seconds and that memory stops growing after warming up, and prints commands per second. `cargo test` sends 5,000 commands in debug builds and 50,000 in release; for a stress run:
+
+```
+SOAK_COMMANDS=1000000 cargo test --release --test soak -- --nocapture
+```
+
+## What CI runs
+
+On every push and pull request (`.github/workflows/ci.yml`):
+
+| Job | Runs |
+|---|---|
+| Test, on Linux and on macOS | `cargo fmt --check`, `cargo clippy`, `cargo doc`, then every test twice: `cargo test` and `cargo test --release` (`tests/memory.rs` on Linux only) |
+| Coverage, on Linux | every test again, measuring which lines run |
+| Fuzz, on Linux | each fuzz target for 60 seconds |
+| Dependencies | `cargo deny check` |
+
+Mutation testing takes about 10 minutes, so it isn't in CI; run it after larger changes.
+
+## Check the tests
 
 **Coverage**: which lines the tests run. Expect about 99% of lines.
 
@@ -71,7 +104,7 @@ cargo install cargo-mutants
 cargo mutants                            # about 10 minutes
 ```
 
-**Fuzzing**: needs Rust's nightly toolchain, used only for fuzzing.
+**Fuzzing**: random input too, but unlike the property tests it mutates raw bytes for as long as you let it, steering toward input that reaches new code, and runs outside `cargo test`. It needs Rust's nightly toolchain, used only for fuzzing.
 
 ```
 rustup toolchain install nightly
@@ -83,7 +116,7 @@ fuzz/run.sh tree
 
 A failing input is saved in `fuzz/artifacts/<target>/`; `cargo +nightly fuzz run <target> <file>` replays it.
 
-**Dependencies**: known vulnerabilities, licenses and sources of every dependency.
+**Dependencies**: checks every dependency for known vulnerabilities, its license and where it comes from, and that the receiver uses only the libraries the spec allows (the allowlist in `deny.toml`).
 
 ```
 cargo install cargo-deny
@@ -108,6 +141,7 @@ src/
   timeline.rs   timestamp correction, in exact 128-bit arithmetic
   sync.rs       per-camera queues and pairing
   camera.rs     the two cameras, and one value per camera
-tests/          transcripts, rules, keys, restarts, reference model, command line
+tests/          transcripts, rules, keys, restarts, reference model, soak, command line
 fuzz/           fuzz targets, seeds and dictionary (a separate crate)
+demo/           the presentation demo: run.sh and the session it plays
 ```

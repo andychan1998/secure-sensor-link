@@ -17,8 +17,32 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The spec allows only the standard library, a JSON library, a hex library and
+# an HMAC-SHA256 library. Every crate that goes into the receiver must be
+# listed here, so a new one fails this check until someone decides it belongs
+# to one of those three. Test-only crates are unrestricted (see [graph]).
+allow-workspace = true
+allow = [
+    # The JSON library: serde_json, the serde framework it is built on, and
+    # their internal parts.
+    "serde", "serde_core", "serde_json", "itoa", "memchr", "zmij",
+    # serde's code generator for #[derive(Deserialize)]; it runs inside the
+    # compiler and nothing of it is in the receiver.
+    "serde_derive", "proc-macro2", "quote", "syn", "unicode-ident",
+    # The hex library.
+    "hex",
+    # The HMAC-SHA256 library: hmac + sha2, and the RustCrypto parts they are
+    # built from.
+    "hmac", "sha2", "digest", "block-buffer", "crypto-common", "hybrid-array",
+    "typenum", "zeroize", "ctutils", "cmov", "cpufeatures", "cfg-if", "libc",
+]
 
 [sources]
 # Only crates.io; no git dependencies.
 unknown-registry = "deny"
 unknown-git = "deny"
+
+[graph]
+# Leave dev-dependencies out of every check: the spec puts no limit on
+# test-only crates, and none of them ends up in the receiver.
+exclude-dev = true

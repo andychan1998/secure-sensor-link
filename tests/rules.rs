@@ -165,6 +165,48 @@ fn trees_at_the_depth_limit_pass_and_deeper_ones_are_rejected() {
     );
 }
 
+// ---- Q3: a pair window wide enough to match two frames ----
+
+#[test]
+fn a_wide_window_pairs_the_two_oldest_frames_not_the_closest() {
+    // With a 30 ms window and a 50 ms period, cam2's frame at 1030 is within the
+    // window of both cam1 frames, and closer to 1050. Step 1 compares the oldest
+    // frame in each queue, so it pairs with 1000.
+    let mut h = Harness::default();
+    h.ok(&init_line(50, 5, 30, 4));
+    accept(&mut h, &Frame::new(1, 1, 1000));
+    accept(&mut h, &Frame::new(1, 2, 1050));
+    let response = accept(&mut h, &Frame::new(2, 1, 1030));
+    assert_eq!(
+        response["synced"],
+        json!([{"timestamp": 1015, "cam1": 1, "cam2": 1}])
+    );
+    assert_eq!(h.state()["cameras"]["cam1"]["pending"], json!([2]));
+}
+
+#[test]
+fn with_a_wide_window_one_lost_frame_can_shift_every_later_pair() {
+    // The cost of following step 1, recorded with the decision: when the window
+    // reaches period_ms - max_jitter_ms, a lost frame makes each later frame pair
+    // with the other camera's frame from one period earlier. Configuration
+    // avoids it by keeping 2 * pair_window_ms below period_ms - max_jitter_ms.
+    let mut h = Harness::default();
+    h.ok(&init_line(50, 5, 45, 4));
+    // cam1's seq 1 is lost; cam2 runs 5 ms behind.
+    accept(&mut h, &Frame::new(2, 1, 1005));
+    let second = accept(&mut h, &Frame::new(1, 2, 1050));
+    assert_eq!(
+        second["synced"],
+        json!([{"timestamp": 1027, "cam1": 2, "cam2": 1}])
+    );
+    accept(&mut h, &Frame::new(2, 2, 1055));
+    let third = accept(&mut h, &Frame::new(1, 3, 1100));
+    assert_eq!(
+        third["synced"],
+        json!([{"timestamp": 1077, "cam1": 3, "cam2": 2}])
+    );
+}
+
 // ---- Arithmetic at the extremes ----
 
 #[test]
