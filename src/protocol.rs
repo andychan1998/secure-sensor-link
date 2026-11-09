@@ -48,6 +48,7 @@ pub const MAX_LINE_LEN: usize = 256 * 1024;
 pub fn run<R: BufRead, W: Write>(mut input: R, mut output: W) -> io::Result<()> {
     let mut session: Session = Session::default();
     let mut line = Vec::new();
+    let mut reply = Vec::with_capacity(RESPONSE_CAPACITY);
     loop {
         let response = match read_line(&mut input, &mut line)? {
             Line::End => return Ok(()),
@@ -58,7 +59,7 @@ pub fn run<R: BufRead, W: Write>(mut input: R, mut output: W) -> io::Result<()> 
         // on the stack, before reading the next one.
         erase(&mut line);
         scrub_stack();
-        write_response(&mut output, &response)?;
+        write_response(&mut output, &mut reply, &response)?;
     }
 }
 
@@ -77,19 +78,26 @@ impl<S> Default for Session<S> {
 }
 
 impl<S: Storage + Default> Session<S> {
-    /// Handles one input line, under the panic safety net.
-    pub fn handle_line(&mut self, line: &[u8]) -> Response {
+    /// Handles one input line, under the panic safety net. A `receive`
+    /// response borrows the frame's tree and records from the receiver, so it
+    /// must be written before the next line is handled.
+    pub fn handle_line(&mut self, line: &[u8]) -> Response<'_> {
         // A panic in planning leaves the state untouched, so carrying on is
         // safe. A panic during a commit is detected by the receiver itself,
         // which then refuses changes until a restart.
-        panic::catch_unwind(AssertUnwindSafe(|| match self.execute(line) {
-            Ok(payload) => Response::Ok(payload),
-            Err(error) => Response::error(&error),
+        panic::catch_unwind(AssertUnwindSafe(move || {
+            // Moving the session in makes this closure run only once, which
+            // lets the response it returns borrow from the session.
+            let session = self;
+            match session.execute(line) {
+                Ok(payload) => Response::Ok(payload),
+                Err(error) => Response::error(&error),
+            }
         }))
         .unwrap_or_else(|_| Response::error(&CommandError::Internal))
     }
 
-    fn execute(&mut self, line: &[u8]) -> Result<Payload, CommandError> {
+    fn execute(&mut self, line: &[u8]) -> Result<Payload<'_>, CommandError> {
         // serde would quote a top-level string in its error.
         if line
             .trim_ascii_start()
@@ -138,7 +146,7 @@ impl<S: Storage + Default> Session<S> {
         }
     }
 
-    fn init(&mut self, params: &InitParams<'_>) -> Result<Payload, CommandError> {
+    fn init(&mut self, params: &InitParams<'_>) -> Result<Payload<'static>, CommandError> {
         if self.receiver.is_some() {
             return Err(CommandError::AlreadyInitialized);
         }
@@ -336,16 +344,28 @@ fn read_line<R: BufRead>(input: &mut R, buf: &mut Vec<u8>) -> io::Result<Line> {
     }
 }
 
-/// Writes one response line. The whole line is built first and written at
-/// once, so a failed write never leaves part of a response followed by
-/// another.
-fn write_response<W: Write>(output: &mut W, response: &Response) -> io::Result<()> {
+/// Room reserved for one response line, so building one never allocates. The
+/// largest response is about 83 KB: a frame whose tree has the longest level
+/// order, releasing 1,024 waiting frames, all with the longest numbers (the
+/// test that builds it checks it fits). Every other response is smaller.
+pub const RESPONSE_CAPACITY: usize = 128 * 1024;
+
+/// Writes one response line. The whole line is built first, in `reply`, and
+/// written at once, so a failed write never leaves part of a response
+/// followed by another.
+fn write_response<W: Write>(
+    output: &mut W,
+    reply: &mut Vec<u8>,
+    response: &Response<'_>,
+) -> io::Result<()> {
+    reply.clear();
     // Serializing these types can't fail; still, keep one line per command.
-    let mut line = serde_json::to_vec(response).unwrap_or_else(|_| {
-        br#"{"status":"error","payload":{"message":"internal error"}}"#.to_vec()
-    });
-    line.push(b'\n');
-    output.write_all(&line)?;
+    if serde_json::to_writer(&mut *reply, response).is_err() {
+        reply.clear();
+        reply.extend_from_slice(br#"{"status":"error","payload":{"message":"internal error"}}"#);
+    }
+    reply.push(b'\n');
+    output.write_all(reply)?;
     output.flush()
 }
 
@@ -451,12 +471,12 @@ impl<'de: 'a, 'a> Deserialize<'de> for KeyText<'a> {
 /// One response line.
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", content = "payload", rename_all = "lowercase")]
-pub enum Response {
-    Ok(Payload),
+pub enum Response<'a> {
+    Ok(Payload<'a>),
     Error(ErrorPayload),
 }
 
-impl Response {
+impl Response<'_> {
     fn error(error: &CommandError) -> Self {
         Self::Error(ErrorPayload {
             message: error.to_string(),
@@ -466,9 +486,9 @@ impl Response {
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
-pub enum Payload {
+pub enum Payload<'a> {
     State(State),
-    Received(Received),
+    Received(Received<'a>),
 }
 
 #[derive(Debug, Serialize)]
@@ -478,23 +498,23 @@ pub struct ErrorPayload {
 
 /// The payload of a successful `receive`.
 #[derive(Debug, Serialize)]
-pub struct Received {
-    frame: FrameView,
-    synced: Vec<SyncRecord>,
+pub struct Received<'a> {
+    frame: FrameView<'a>,
+    synced: &'a [SyncRecord],
 }
 
 #[derive(Debug, Serialize)]
-struct FrameView {
+struct FrameView<'a> {
     camera: Camera,
     key_id: KeyId,
     seq: u32,
     timestamp: Millis,
     corrected: bool,
-    tree: Vec<Option<i32>>,
+    tree: &'a [Option<i32>],
 }
 
-impl From<Accepted> for Received {
-    fn from(accepted: Accepted) -> Self {
+impl<'a> From<Accepted<'a>> for Received<'a> {
+    fn from(accepted: Accepted<'a>) -> Self {
         Self {
             frame: FrameView {
                 camera: accepted.camera,

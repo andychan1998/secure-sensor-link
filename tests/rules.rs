@@ -12,6 +12,7 @@
 
 mod support;
 
+use secure_sensor_link::protocol::RESPONSE_CAPACITY;
 use serde_json::{Value, json};
 use support::{
     Frame, GET_STATE, Harness, KEY1, KEY2, MAX_PAYLOAD_LEN, add_key_line, complete_tree, init_line,
@@ -280,6 +281,60 @@ fn at_the_largest_queue_limit_the_oldest_is_dropped_and_one_frame_can_release_al
     assert_eq!(response["synced"], Value::Array(released));
     assert_eq!(h.state()["cameras"]["cam1"]["pending"], json!([]));
     assert_eq!(h.state()["cameras"]["cam2"]["pending"], json!([1]));
+}
+
+/// A tree of 1,023 nodes, all `i32::MIN`, shaped for the longest level order:
+/// a complete top of 31 nodes, then 32 chains of 31 nodes going left, so
+/// almost every node lists a `null` for its missing right child.
+fn longest_tree() -> Vec<u8> {
+    fn node(out: &mut Vec<u8>) {
+        out.push(0x01);
+        out.extend(i32::MIN.to_be_bytes());
+    }
+    fn top(levels: u32, out: &mut Vec<u8>) {
+        if levels == 0 {
+            // A chain: each node's left child is the next node, and every right
+            // child is missing.
+            for _ in 0..31 {
+                node(out);
+            }
+            out.extend([0x00; 32]);
+            return;
+        }
+        node(out);
+        top(levels - 1, out);
+        top(levels - 1, out);
+    }
+    let mut out = Vec::new();
+    top(5, &mut out);
+    out
+}
+
+#[test]
+fn the_largest_response_fits_the_room_reserved_for_it() {
+    // A full queue of cam1 frames with the longest seqs and timestamps, all
+    // released by one cam2 frame carrying the tree with the longest level order.
+    let mut h = Harness::default();
+    h.ok(&init_line(50, 5, 20, 1_024));
+    let first_seq = u32::MAX - 2_000;
+    let first_timestamp = i64::MAX - 100_000;
+    for n in 0..1_025 {
+        let frame = Frame::new(1, first_seq + n, first_timestamp + i64::from(n) * 50);
+        accept(&mut h, &frame);
+    }
+    let frame = Frame::new(2, u32::MAX, i64::MAX).payload(longest_tree());
+    let bytes = h.send_bytes(&receive_line(&frame.hex()));
+    let response: Value = serde_json::from_slice(&bytes).unwrap();
+    let payload = &response["payload"];
+    assert_eq!(payload["frame"]["tree"].as_array().unwrap().len(), 1_982);
+    assert_eq!(payload["synced"].as_array().unwrap().len(), 1_024);
+    // The whole line, newline included.
+    let line_len = bytes.len() + 1;
+    assert!(line_len > 80_000, "not the worst case: {line_len} bytes");
+    assert!(
+        line_len < RESPONSE_CAPACITY,
+        "{line_len} bytes doesn't fit the {RESPONSE_CAPACITY} reserved"
+    );
 }
 
 // ---- Arithmetic at the extremes ----

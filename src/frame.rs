@@ -35,22 +35,30 @@ pub const MAX_FRAME_LEN: usize = V2_HEADER_LEN + 65_535 + TAG_LEN;
 /// Largest possible frame in hex characters.
 pub const MAX_FRAME_HEX_LEN: usize = 2 * MAX_FRAME_LEN;
 
-/// Decodes a frame's hex text (either case) into bytes.
+/// Decodes a frame's hex text (either case) into `out`, replacing what it held.
 ///
-/// The length is checked before anything is allocated, so an oversized frame
-/// costs nothing.
+/// The length is checked before anything is written, so an oversized frame
+/// costs nothing. The bytes go into `out`'s existing room: with room for
+/// [`MAX_FRAME_LEN`] bytes reserved once, decoding never allocates.
 ///
 /// # Errors
 ///
-/// Returns an error if the text is too long, has an odd length or isn't hex.
-pub fn decode_hex(hex: &str) -> Result<Vec<u8>, FrameError> {
+/// Returns an error if the text is too long, has an odd length or isn't hex;
+/// then `out` is left empty.
+pub fn decode_hex_into(hex: &str, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    out.clear();
     if hex.len() > MAX_FRAME_HEX_LEN {
         return Err(FrameError::HexTooLong { len: hex.len() });
     }
     if !hex.len().is_multiple_of(2) {
         return Err(FrameError::OddHexLength { len: hex.len() });
     }
-    hex::decode(hex).map_err(|_| FrameError::NotHex)
+    out.resize(hex.len() / 2, 0);
+    let decoded = hex::decode_to_slice(hex, out.as_mut_slice());
+    if decoded.is_err() {
+        out.clear();
+    }
+    decoded.map_err(|_| FrameError::NotHex)
 }
 
 /// A frame whose layout has been checked but whose tag has not.
@@ -339,6 +347,26 @@ mod tests {
             RawFrame::parse(&bytes).unwrap().verify(&other).unwrap_err(),
             FrameError::AuthenticationFailed(Camera::Cam1)
         );
+    }
+
+    /// Decodes into a new buffer.
+    fn decode_hex(hex: &str) -> Result<Vec<u8>, FrameError> {
+        let mut bytes = Vec::new();
+        decode_hex_into(hex, &mut bytes).map(|()| bytes)
+    }
+
+    #[test]
+    fn decoding_reuses_the_room_it_is_given() {
+        let mut bytes = Vec::with_capacity(MAX_FRAME_LEN);
+        let room = bytes.capacity();
+        decode_hex_into(&"ab".repeat(MAX_FRAME_LEN), &mut bytes).unwrap();
+        assert_eq!(bytes.len(), MAX_FRAME_LEN);
+        decode_hex_into("0102", &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2]);
+        // A failed decode leaves nothing behind.
+        assert_eq!(decode_hex_into("01zz", &mut bytes), Err(FrameError::NotHex));
+        assert!(bytes.is_empty());
+        assert_eq!(bytes.capacity(), room);
     }
 
     #[test]

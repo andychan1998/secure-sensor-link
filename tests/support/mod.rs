@@ -203,6 +203,12 @@ impl Harness {
         serde_json::to_value(self.session.handle_line(line.as_bytes())).unwrap()
     }
 
+    /// Sends a line and returns the response exactly as the receiver writes
+    /// it, without the newline.
+    pub fn send_bytes(&mut self, line: &str) -> Vec<u8> {
+        serde_json::to_vec(&self.session.handle_line(line.as_bytes())).unwrap()
+    }
+
     /// Sends a line and returns its payload, failing the test on an error.
     pub fn ok(&mut self, line: &str) -> Value {
         let response = self.send(line);

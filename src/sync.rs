@@ -69,15 +69,14 @@ pub struct SyncPlan {
     removed: PerCamera<usize>,
     /// Whether the new frame stays queued (it may be paired or dropped at once).
     keep_new: bool,
-    records: Vec<SyncRecord>,
 }
 
-impl SyncPlan {
-    /// The records this frame produces, in order.
-    #[must_use]
-    pub fn records(&self) -> &[SyncRecord] {
-        &self.records
-    }
+/// The most records one frame can produce. Pairing runs until one queue is
+/// empty, so frames only ever wait for one camera, at most `max_pending` of
+/// them; a new frame releases at most all of them. One more is room to spare.
+#[must_use]
+pub const fn most_records(max_pending: usize) -> usize {
+    max_pending.saturating_add(1)
 }
 
 /// The two queues of frames waiting for a partner.
@@ -103,12 +102,20 @@ impl Queues {
     }
 
     /// Works out what adding `frame` to `camera`'s queue produces, without
-    /// changing anything.
+    /// changing the queues. The records it produces replace what `records`
+    /// held; with room for [`most_records`] reserved once, that never allocates.
     ///
     /// Returns `None` only if a calculation would overflow, which 128-bit
     /// timestamps make impossible for real inputs.
     #[must_use]
-    pub fn plan(&self, camera: Camera, frame: Pending, config: &Config) -> Option<SyncPlan> {
+    pub fn plan(
+        &self,
+        camera: Camera,
+        frame: Pending,
+        config: &Config,
+        records: &mut Vec<SyncRecord>,
+    ) -> Option<SyncPlan> {
+        records.clear();
         let own = self.queues.get(camera);
         let other = self.queues.get(camera.other());
         // The camera's queue as it would be with the new frame on the end.
@@ -121,7 +128,6 @@ impl Queues {
         };
         let own_len = own.len().checked_add(1)?;
         let window = u128::from(config.pair_window_ms());
-        let mut records = Vec::new();
         let (mut i, mut j) = (0usize, 0usize);
 
         // Step 1.
@@ -165,7 +171,6 @@ impl Queues {
             frame,
             removed,
             keep_new: i <= own.len(),
-            records,
         })
     }
 
@@ -220,9 +225,10 @@ mod tests {
 
     /// Plans and applies, returning the records.
     fn add(queues: &mut Queues, camera: Camera, f: Pending, cfg: &Config) -> Vec<SyncRecord> {
-        let plan = queues.plan(camera, f, cfg).unwrap();
+        let mut records = Vec::new();
+        let plan = queues.plan(camera, f, cfg, &mut records).unwrap();
         queues.apply(&plan);
-        plan.records
+        records
     }
 
     fn pending(queues: &Queues, camera: Camera) -> Vec<u32> {
@@ -319,9 +325,16 @@ mod tests {
             );
         }
         assert_eq!(pending(&q, Camera::Cam1), (77..=1_100).collect::<Vec<_>>());
-        // A much later cam2 frame releases every waiting frame at once.
-        let released = add(&mut q, Camera::Cam2, frame(1, 1_000_000), &cfg);
-        assert_eq!(released.len(), cfg.max_pending());
+        // A much later cam2 frame releases every waiting frame at once, and
+        // they fit the room reserved for one frame's records.
+        let mut records = Vec::with_capacity(most_records(cfg.max_pending()));
+        let records_room = records.capacity();
+        let plan = q
+            .plan(Camera::Cam2, frame(1, 1_000_000), &cfg, &mut records)
+            .unwrap();
+        q.apply(&plan);
+        assert_eq!(records.len(), cfg.max_pending());
+        assert_eq!(records.capacity(), records_room);
         assert!(pending(&q, Camera::Cam1).is_empty());
         assert_eq!(pending(&q, Camera::Cam2), vec![1]);
         assert_eq!(room(&q), reserved);
@@ -413,7 +426,9 @@ mod tests {
         let cfg = config(20, 4);
         let mut q = Queues::new(4);
         add(&mut q, Camera::Cam1, frame(1, 1000), &cfg);
-        let plan = q.plan(Camera::Cam2, frame(1, 1005), &cfg).unwrap();
+        let plan = q
+            .plan(Camera::Cam2, frame(1, 1005), &cfg, &mut Vec::new())
+            .unwrap();
         assert_eq!(pending(&q, Camera::Cam1), vec![1]);
         q.apply(&plan);
         assert!(pending(&q, Camera::Cam1).is_empty());

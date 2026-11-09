@@ -1,12 +1,13 @@
 //! The receiver: checks each frame, then commits its effects.
 //!
 //! Every frame goes through `Receiver::plan`, which runs all checks in the
-//! documented order and computes every result without changing anything, and
-//! then `Receiver::commit`, which first writes to storage whatever must
-//! survive a restart, then applies the plan to memory with steps that can't
-//! fail. A rejected frame, or a failed storage write, changes nothing, with
-//! one exception after a restart (`Decision::BelowRestartFloor`). Key
-//! management (`add_key`, `revoke_key`) follows the same pattern.
+//! documented order and computes every result without changing the receiver's
+//! state (it writes only to its scratch room, `Scratch`), and then
+//! `Receiver::commit`, which first writes to storage whatever must survive a
+//! restart, then applies the plan to memory with steps that can't fail. A
+//! rejected frame, or a failed storage write, changes nothing, with one
+//! exception after a restart (`Decision::BelowRestartFloor`). Key management
+//! (`add_key`, `revoke_key`) follows the same pattern.
 //!
 //! The receiver owns its storage. A restart ([`Receiver::restart`]) throws away
 //! everything in memory and rebuilds it from storage alone.
@@ -23,11 +24,11 @@ use serde::Serialize;
 use crate::camera::{Camera, PerCamera};
 use crate::config::Config;
 use crate::floor::ReplayFloor;
-use crate::frame::{self, FrameError, RawFrame, VerifiedFrame};
+use crate::frame::{self, FrameError, MAX_FRAME_LEN, RawFrame, VerifiedFrame};
 use crate::key::{Key, KeyId};
 use crate::keyring::{AddKeyError, KeyEntry, Keyring, Unusable};
 use crate::storage::{Record, Saved, Storage, StorageError};
-use crate::sync::{Pending, Queues, SyncPlan, SyncRecord};
+use crate::sync::{self, Pending, Queues, SyncPlan, SyncRecord};
 use crate::timeline::{self, Anchor, Millis};
 use crate::tree::{Tree, TreeError};
 
@@ -38,6 +39,39 @@ pub struct Receiver<S> {
     store: S,
     /// Lost on a restart, and rebuilt from `store`.
     memory: Memory,
+    /// Room for one frame's work. Holds nothing between frames.
+    scratch: Scratch,
+}
+
+/// Room for one frame's work, reserved at `init` at the largest size each part
+/// can need: the frame's bytes, its tree and level order, and the records it
+/// produces. Handling a frame then makes no large allocation, the kind most
+/// likely to fail on a fragmented heap.
+///
+/// Holds nothing that matters between frames: each use starts by clearing
+/// what it uses. None of it is secret (frames are signed, not encrypted), so
+/// it needs no erasing.
+struct Scratch {
+    bytes: Vec<u8>,
+    tree: Tree,
+    synced: Vec<SyncRecord>,
+}
+
+/// Leaves out the contents: up to 64 KiB of the last frame is just noise.
+impl fmt::Debug for Scratch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Scratch").finish_non_exhaustive()
+    }
+}
+
+impl Scratch {
+    fn new(config: &Config) -> Self {
+        Self {
+            bytes: Vec::with_capacity(MAX_FRAME_LEN),
+            tree: Tree::with_full_capacity(),
+            synced: Vec::with_capacity(sync::most_records(config.max_pending())),
+        }
+    }
 }
 
 /// Everything the receiver holds in memory. A restart replaces it whole, so
@@ -69,37 +103,36 @@ impl Memory {
     }
 }
 
-/// What an accepted frame produced.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Accepted {
+/// What an accepted frame produced. The tree and records are borrowed from
+/// the receiver's scratch room, so they last until its next command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Accepted<'a> {
     pub camera: Camera,
     pub key_id: KeyId,
     pub seq: u32,
     pub timestamp: Millis,
     pub corrected: bool,
-    pub tree: Vec<Option<i32>>,
-    pub synced: Vec<SyncRecord>,
+    pub tree: &'a [Option<i32>],
+    pub synced: &'a [SyncRecord],
 }
 
-/// Everything an accepted frame will change, computed before changing it.
+/// Everything an accepted frame will change, computed before changing it. The
+/// frame's tree and records wait in the scratch room.
 #[derive(Debug)]
 struct Plan {
     camera: Camera,
+    key_id: KeyId,
     anchor: Anchor,
+    corrected: bool,
     /// The floor to save first, if the saved one doesn't cover this seq.
     floor: Option<u64>,
     /// The camera's keys afterwards, if the frame moves it to a new key.
     keys: Option<Keyring>,
-    accepted: Accepted,
     sync: SyncPlan,
 }
 
 /// What the checks decided for a frame.
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "made once per frame and consumed at once; boxing would only add an allocation"
-)]
 enum Decision {
     Accept(Plan),
     /// Rejected only because its seq is at or below the floor loaded at the
@@ -134,6 +167,7 @@ impl<S: Storage> Receiver<S> {
         Ok(Self {
             store,
             memory: Memory::new(config, keys, PerCamera::default()),
+            scratch: Scratch::new(&config),
         })
     }
 
@@ -170,11 +204,11 @@ impl<S: Storage> Receiver<S> {
     /// with one exception: after a restart, a frame rejected only because of
     /// the restart floor, but otherwise valid, still moves its camera to its
     /// key (see `Decision::BelowRestartFloor`).
-    pub fn receive(&mut self, frame_hex: &str) -> Result<Accepted, ReceiveError> {
+    pub fn receive(&mut self, frame_hex: &str) -> Result<Accepted<'_>, ReceiveError> {
         if self.is_halted() {
             return Err(ReceiveError::Halted);
         }
-        match self.plan(frame_hex)? {
+        match Self::plan(&self.memory, &mut self.scratch, frame_hex)? {
             Decision::Accept(plan) => self.commit(plan),
             Decision::BelowRestartFloor { camera, seq, keys } => {
                 if let Some(keys) = keys {
@@ -193,13 +227,16 @@ impl<S: Storage> Receiver<S> {
         self.memory.commit_in_progress
     }
 
-    /// Runs every check, in order, and computes the frame's effects.
-    fn plan(&self, frame_hex: &str) -> Result<Decision, ReceiveError> {
-        let memory = &self.memory;
-
+    /// Runs every check, in order, and computes the frame's effects. Reads
+    /// memory only; works in `scratch`.
+    fn plan(
+        memory: &Memory,
+        scratch: &mut Scratch,
+        frame_hex: &str,
+    ) -> Result<Decision, ReceiveError> {
         // 1-3: hex, version, layout. Only the camera and key id are readable.
-        let bytes = frame::decode_hex(frame_hex)?;
-        let raw = RawFrame::parse(&bytes)?;
+        frame::decode_hex_into(frame_hex, &mut scratch.bytes)?;
+        let raw = RawFrame::parse(&scratch.bytes)?;
         let camera = raw.camera();
         let key_id = raw.key_id();
 
@@ -224,7 +261,7 @@ impl<S: Storage> Receiver<S> {
         }
         let floor = memory.floors.get(camera);
         // 7-8: timestamp, then the tree, the most complex parsing, last.
-        let contents = check_contents(&frame);
+        let contents = check_contents(&frame, &mut scratch.tree);
         if !floor.admits(seq) {
             // Reported as stale whatever 7-8 found, as the order of checks says.
             return Ok(Decision::BelowRestartFloor {
@@ -233,7 +270,7 @@ impl<S: Storage> Receiver<S> {
                 keys: contents.ok().and_then(|_| keys.after_use(key_id)),
             });
         }
-        let (raw_timestamp, tree) = contents?;
+        let raw_timestamp = contents?;
 
         // Effects: timestamp correction and pairing.
         let corrected = timeline::correct(last, seq, raw_timestamp, &memory.config)
@@ -245,33 +282,26 @@ impl<S: Storage> Receiver<S> {
         };
         let sync = memory
             .queues
-            .plan(camera, pending, &memory.config)
+            .plan(camera, pending, &memory.config, &mut scratch.synced)
             .ok_or(ReceiveError::Internal)?;
 
         Ok(Decision::Accept(Plan {
             camera,
+            key_id,
             anchor: Anchor {
                 seq,
                 timestamp: corrected.timestamp,
             },
+            corrected: corrected.corrected,
             floor: floor.to_save(seq, memory.config.persist_interval()),
             keys: keys.after_use(key_id),
-            accepted: Accepted {
-                camera,
-                key_id,
-                seq,
-                timestamp: corrected.timestamp,
-                corrected: corrected.corrected,
-                tree: tree.level_order(),
-                synced: sync.records().to_vec(),
-            },
             sync,
         }))
     }
 
     /// Writes what must survive a restart, then applies the plan to memory.
     /// Only the storage write can fail, and then nothing has changed.
-    fn commit(&mut self, plan: Plan) -> Result<Accepted, ReceiveError> {
+    fn commit(&mut self, plan: Plan) -> Result<Accepted<'_>, ReceiveError> {
         let camera = plan.camera;
         self.begin_commit(&[
             plan.floor.map(|floor| Record::Floor(camera, floor)),
@@ -289,7 +319,16 @@ impl<S: Storage> Receiver<S> {
         }
         memory.queues.apply(&plan.sync);
         memory.commit_in_progress = false;
-        Ok(plan.accepted)
+        let scratch = &mut self.scratch;
+        Ok(Accepted {
+            camera,
+            key_id: plan.key_id,
+            seq: plan.anchor.seq,
+            timestamp: plan.anchor.timestamp,
+            corrected: plan.corrected,
+            tree: scratch.tree.level_order(),
+            synced: &scratch.synced,
+        })
     }
 
     /// Marks a commit as in progress, then writes the given records (skipping
@@ -400,14 +439,14 @@ impl<S: Storage> Receiver<S> {
 }
 
 /// Checks 7 and 8: the timestamp isn't negative, and the payload is a tree
-/// within the limits. Returns the timestamp and the tree.
-fn check_contents(frame: &VerifiedFrame<'_>) -> Result<(i64, Tree), ReceiveError> {
+/// within the limits. Returns the timestamp; the tree is decoded into `tree`.
+fn check_contents(frame: &VerifiedFrame<'_>, tree: &mut Tree) -> Result<i64, ReceiveError> {
     let raw_timestamp = frame.timestamp();
     if raw_timestamp < 0 {
         return Err(ReceiveError::NegativeTimestamp(raw_timestamp));
     }
-    let tree = Tree::decode(frame.payload())?;
-    Ok((raw_timestamp, tree))
+    tree.decode_from(frame.payload())?;
+    Ok(raw_timestamp)
 }
 
 /// The receiver state as reported in responses.
@@ -730,6 +769,79 @@ mod tests {
         assert!(r.memory.floors.get(Camera::Cam2).admits(0));
         assert_ne!(r.memory.floors, before, "the loaded floor now applies");
         assert_eq!(r.memory.config, config());
+    }
+
+    /// A version 1 frame from `camera`, signed with `key`.
+    fn signed(camera: u8, seq: u32, timestamp: i64, payload: &[u8], key: &str) -> String {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+        let mut bytes = vec![1, camera];
+        bytes.extend(seq.to_be_bytes());
+        bytes.extend(timestamp.to_be_bytes());
+        bytes.extend(u16::try_from(payload.len()).unwrap().to_be_bytes());
+        bytes.extend(payload);
+        let mut mac = Hmac::<Sha256>::new_from_slice(&hex::decode(key).unwrap()).unwrap();
+        mac.update(&bytes);
+        bytes.extend(mac.finalize().into_bytes());
+        hex::encode(bytes)
+    }
+
+    /// A complete tree of `nodes` nodes, every value -1.
+    fn complete_tree(nodes: usize) -> Vec<u8> {
+        fn encode(index: usize, nodes: usize, out: &mut Vec<u8>) {
+            if index >= nodes {
+                out.push(0x00);
+                return;
+            }
+            out.push(0x01);
+            out.extend((-1_i32).to_be_bytes());
+            encode(2 * index + 1, nodes, out);
+            encode(2 * index + 2, nodes, out);
+        }
+        let mut out = Vec::new();
+        encode(0, nodes, &mut out);
+        out
+    }
+
+    /// The capacity of each part of the scratch room.
+    fn room(r: &Receiver<MemoryStore>) -> ([usize; 2], [usize; 4]) {
+        (
+            [r.scratch.bytes.capacity(), r.scratch.synced.capacity()],
+            r.scratch.tree.room(),
+        )
+    }
+
+    #[test]
+    fn the_scratch_room_never_grows_even_at_the_largest_sizes() {
+        let config = Config::new(ConfigInput {
+            period_ms: 50,
+            max_jitter_ms: 5,
+            pair_window_ms: 20,
+            max_pending: crate::config::MAX_PENDING_LIMIT,
+            persist_interval: None,
+        })
+        .unwrap();
+        let mut r = Receiver::new(config, keys(), MemoryStore::default()).unwrap();
+        let reserved = room(&r);
+        assert_eq!(reserved.0, [MAX_FRAME_LEN, 1_025]);
+
+        // cam2 is silent: cam1's queue fills to 1,024 and stays there.
+        for seq in 1..=1_100 {
+            let frame = signed(1, seq, 1000 + i64::from(seq) * 50, &[0x00], KEY1);
+            r.receive(&frame).unwrap();
+        }
+        // The largest frame there can be: decoded, then refused for its tree.
+        let mut largest = complete_tree(1_025);
+        largest.resize(65_535, 0x00);
+        let frame = signed(2, 1, 1000, &largest, KEY2);
+        assert!(matches!(r.receive(&frame), Err(ReceiveError::Tree(_))));
+        // A full-size tree that releases every waiting frame: the most one
+        // frame can produce.
+        let frame = signed(2, 2, 1_000_000, &complete_tree(1_024), KEY2);
+        let accepted = r.receive(&frame).unwrap();
+        assert_eq!(accepted.tree.len(), 1_024);
+        assert_eq!(accepted.synced.len(), 1_024);
+        assert_eq!(room(&r), reserved);
     }
 
     #[test]

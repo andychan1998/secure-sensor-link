@@ -6,8 +6,11 @@
 //! The decoder never recurses: it keeps its own stack of pending child slots, so
 //! stack use doesn't depend on the input. It stops at the first node past
 //! [`MAX_NODES`] or deeper than [`MAX_DEPTH`].
+//!
+//! A [`Tree`] is also the room its decoding and level order work in. One made
+//! by [`Tree::with_full_capacity`] has room for the largest tree, so decoding
+//! into it again and again ([`Tree::decode_from`]) never allocates.
 
-use std::collections::VecDeque;
 use std::fmt;
 
 /// Most nodes a tree may have. Raising it is a one-line change.
@@ -25,13 +28,33 @@ const ABSENT: u8 = 0x00;
 const PRESENT: u8 = 0x01;
 /// Smallest encoding of one present node: marker plus value.
 const MIN_NODE_BYTES: usize = 5;
+/// Most child slots the decoder holds at once: at most one pending right slot
+/// per level, plus the slot being read.
+const STACK_LEN: usize = MAX_DEPTH + 2;
 
-/// A decoded tree, stored as an array of nodes linked by index.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A decoded tree, stored as an array of nodes linked by index, plus the room
+/// that decoding it and listing it in level order use.
+#[derive(Clone, Debug)]
 pub struct Tree {
     nodes: Vec<Node>,
     root: Option<u16>,
+    /// Decoding: the child slots still to read.
+    stack: Vec<Slot>,
+    /// Level order: each position's node, or `None` for a missing child.
+    order: Vec<Option<u16>>,
+    /// Level order: the values written by the last [`Tree::level_order`].
+    levels: Vec<Option<i32>>,
 }
+
+/// Two trees are equal when they hold the same nodes; the work space doesn't
+/// count.
+impl PartialEq for Tree {
+    fn eq(&self, other: &Self) -> bool {
+        self.nodes == other.nodes && self.root == other.root
+    }
+}
+
+impl Eq for Tree {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Node {
@@ -56,27 +79,68 @@ struct Slot {
 }
 
 impl Tree {
-    /// Decodes exactly one tree from `payload`.
+    /// An empty tree with room for `nodes` nodes, and for decoding and listing
+    /// a tree that size.
+    fn with_capacity(nodes: usize) -> Self {
+        // Each present node adds itself and two child entries: at most 2n + 1.
+        let positions = nodes.saturating_mul(2).saturating_add(1);
+        Self {
+            nodes: Vec::with_capacity(nodes),
+            root: None,
+            stack: Vec::with_capacity(STACK_LEN),
+            order: Vec::with_capacity(positions),
+            levels: Vec::with_capacity(positions),
+        }
+    }
+
+    /// An empty tree with room for the largest tree, reserved once: decoding
+    /// into it with [`Tree::decode_from`] never allocates.
+    #[must_use]
+    pub fn with_full_capacity() -> Self {
+        Self::with_capacity(MAX_NODES)
+    }
+
+    /// Decodes exactly one tree from `payload` into a new tree with just the
+    /// room this payload can need.
+    ///
+    /// # Errors
+    ///
+    /// As [`Tree::decode_from`].
+    pub fn decode(payload: &[u8]) -> Result<Self, TreeError> {
+        let mut tree = Self::with_capacity(MAX_NODES.min(payload.len() / MIN_NODE_BYTES));
+        tree.decode_from(payload)?;
+        Ok(tree)
+    }
+
+    /// Replaces this tree with the one decoded from `payload`, reusing its room.
     ///
     /// # Errors
     ///
     /// Returns an error if the encoding is invalid, has bytes left over, or the
-    /// tree exceeds [`MAX_NODES`] or [`MAX_DEPTH`].
-    pub fn decode(payload: &[u8]) -> Result<Self, TreeError> {
+    /// tree exceeds [`MAX_NODES`] or [`MAX_DEPTH`]; then the tree is left empty.
+    pub fn decode_from(&mut self, payload: &[u8]) -> Result<(), TreeError> {
+        let decoded = self.read(payload);
+        if decoded.is_err() {
+            self.clear();
+        }
+        decoded
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.root = None;
+        self.stack.clear();
+    }
+
+    fn read(&mut self, payload: &[u8]) -> Result<(), TreeError> {
+        self.clear();
         let mut rest = payload;
-        let capacity = MAX_NODES.min(payload.len() / MIN_NODE_BYTES);
-        let mut tree = Self {
-            nodes: Vec::with_capacity(capacity),
-            root: None,
-        };
-        // At most one pending right slot per level, plus the slot being read.
-        let mut stack: Vec<Slot> = Vec::with_capacity(MAX_DEPTH.saturating_add(2));
-        stack.push(Slot {
+        self.stack.push(Slot {
             parent: Parent::Root,
             depth: 1,
         });
 
-        while let Some(slot) = stack.pop() {
+        while let Some(slot) = self.stack.pop() {
             let offset = payload.len().saturating_sub(rest.len());
             let (&marker, after_marker) = rest.split_first().ok_or(TreeError::Truncated)?;
             rest = after_marker;
@@ -86,20 +150,20 @@ impl Tree {
                     if slot.depth > MAX_DEPTH {
                         return Err(TreeError::TooDeep);
                     }
-                    if tree.nodes.len() >= MAX_NODES {
+                    if self.nodes.len() >= MAX_NODES {
                         return Err(TreeError::TooManyNodes);
                     }
                     let (value, after_value) =
                         rest.split_first_chunk::<4>().ok_or(TreeError::Truncated)?;
                     rest = after_value;
-                    let index = tree.push(i32::from_be_bytes(*value), slot.parent)?;
+                    let index = self.push(i32::from_be_bytes(*value), slot.parent)?;
                     let child_depth = slot.depth.checked_add(1).ok_or(TreeError::TooDeep)?;
                     // Right is pushed first so the left subtree is read first.
-                    stack.push(Slot {
+                    self.stack.push(Slot {
                         parent: Parent::Right(index),
                         depth: child_depth,
                     });
-                    stack.push(Slot {
+                    self.stack.push(Slot {
                         parent: Parent::Left(index),
                         depth: child_depth,
                     });
@@ -114,7 +178,7 @@ impl Tree {
         }
 
         if rest.is_empty() {
-            Ok(tree)
+            Ok(())
         } else {
             Err(TreeError::TrailingBytes { count: rest.len() })
         }
@@ -136,10 +200,6 @@ impl Tree {
         Ok(index)
     }
 
-    fn node(&self, index: u16) -> Option<&Node> {
-        self.nodes.get(usize::from(index))
-    }
-
     fn node_mut(&mut self, index: u16) -> Result<&mut Node, TreeError> {
         self.nodes
             .get_mut(usize::from(index))
@@ -158,28 +218,47 @@ impl Tree {
         self.nodes.is_empty()
     }
 
+    /// The capacity of each part of the tree's room, for tests that check it
+    /// never grows.
+    #[cfg(test)]
+    pub(crate) fn room(&self) -> [usize; 4] {
+        [
+            self.nodes.capacity(),
+            self.stack.capacity(),
+            self.order.capacity(),
+            self.levels.capacity(),
+        ]
+    }
+
     /// The tree in level order, with `None` for each missing child of a present
     /// node and trailing `None`s removed: `[1,2,3,null,null,4,5]` in JSON.
-    #[must_use]
-    pub fn level_order(&self) -> Vec<Option<i32>> {
-        // Each present node adds itself and two child entries: at most 2n + 1.
-        let mut out = Vec::with_capacity(self.nodes.len().saturating_mul(2).saturating_add(1));
-        let mut queue = VecDeque::with_capacity(self.nodes.len().saturating_add(1));
-        queue.push_back(self.root);
-        while let Some(entry) = queue.pop_front() {
-            match entry.and_then(|index| self.node(index)) {
-                Some(node) => {
-                    out.push(Some(node.value));
-                    queue.push_back(node.left);
-                    queue.push_back(node.right);
-                }
-                None => out.push(None),
+    ///
+    /// Written into room the tree keeps for it, so it doesn't allocate when the
+    /// tree has room for its size, as every tree does.
+    pub fn level_order(&mut self) -> &[Option<i32>] {
+        // Breadth first: `order` is both the queue and the result. Each present
+        // node appends its two children, and `next` walks along behind.
+        self.order.clear();
+        self.order.push(self.root);
+        let mut next = 0_usize;
+        while let Some(&entry) = self.order.get(next) {
+            next = next.saturating_add(1);
+            if let Some(node) = entry.and_then(|index| self.nodes.get(usize::from(index))) {
+                self.order.push(node.left);
+                self.order.push(node.right);
             }
         }
-        while out.last() == Some(&None) {
-            out.pop();
+        let nodes = &self.nodes;
+        self.levels.clear();
+        self.levels.extend(self.order.iter().map(|entry| {
+            entry
+                .and_then(|index| nodes.get(usize::from(index)))
+                .map(|node| node.value)
+        }));
+        while self.levels.last() == Some(&None) {
+            self.levels.pop();
         }
-        out
+        &self.levels
     }
 }
 
@@ -274,7 +353,7 @@ mod tests {
         let bytes =
             hex::decode("01000000010100000002000001000000030100000004000001000000050000").unwrap();
         assert_eq!(bytes.len(), 31);
-        let tree = Tree::decode(&bytes).unwrap();
+        let mut tree = Tree::decode(&bytes).unwrap();
         assert!(!tree.is_empty());
         assert_eq!(tree.len(), 5);
         assert_eq!(
@@ -296,8 +375,68 @@ mod tests {
     }
 
     #[test]
+    fn trees_are_equal_when_their_nodes_are_whatever_their_work_space_holds() {
+        let spec =
+            hex::decode("01000000010100000002000001000000030100000004000001000000050000").unwrap();
+        let fresh = Tree::decode(&spec).unwrap();
+        let mut reused = Tree::with_full_capacity();
+        reused.decode_from(&balanced(MAX_NODES)).unwrap();
+        reused.level_order();
+        reused.decode_from(&spec).unwrap();
+        assert_eq!(fresh, reused);
+        // Same root, different nodes; same nodes, no root.
+        let mut other = node(1);
+        other.extend([ABSENT, ABSENT]);
+        assert_ne!(fresh, Tree::decode(&other).unwrap());
+        let empty = Tree::decode(&[ABSENT]).unwrap();
+        let mut rootless = empty.clone();
+        rootless.nodes.clone_from(&fresh.nodes);
+        assert_ne!(fresh, rootless);
+        assert_ne!(rootless, empty);
+    }
+
+    #[test]
+    fn a_full_capacity_tree_is_reused_for_every_tree_without_growing() {
+        let mut tree = Tree::with_full_capacity();
+        let reserved = tree.room();
+        // Worked out from the limits here, not from the code's own constant.
+        let positions = 2 * MAX_NODES + 1;
+        assert_eq!(reserved, [MAX_NODES, MAX_DEPTH + 2, positions, positions]);
+        // The largest and deepest trees there are, the deepest input there can
+        // be, and a tree too large: none needs more room than was reserved.
+        for (payload, ok) in [
+            (balanced(MAX_NODES), true),
+            (left_chain(MAX_DEPTH), true),
+            (right_chain(MAX_DEPTH), true),
+            (left_chain(MAX_DEPTH + 1), false),
+            (right_chain(10_922), false),
+            (balanced(MAX_NODES + 1), false),
+        ] {
+            assert_eq!(tree.decode_from(&payload).is_ok(), ok);
+            if ok {
+                let levels = tree.level_order().len();
+                assert!(levels >= tree.len());
+            } else {
+                // A failed decode leaves the tree empty.
+                assert!(tree.is_empty());
+                assert_eq!(tree.level_order(), Vec::<Option<i32>>::new());
+            }
+            assert_eq!(tree.room(), reserved);
+        }
+        // Decoding replaces the previous tree completely.
+        tree.decode_from(
+            &node(7)
+                .into_iter()
+                .chain([ABSENT, ABSENT])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(tree.level_order(), vec![Some(7)]);
+    }
+
+    #[test]
     fn empty_tree_is_one_zero_byte() {
-        let tree = Tree::decode(&[ABSENT]).unwrap();
+        let mut tree = Tree::decode(&[ABSENT]).unwrap();
         assert!(tree.is_empty());
         assert_eq!(tree.level_order(), Vec::<Option<i32>>::new());
         assert_eq!(Tree::decode(&[]), Err(TreeError::Truncated));
@@ -346,7 +485,7 @@ mod tests {
 
     #[test]
     fn node_limit_is_exact() {
-        let at_limit = Tree::decode(&balanced(MAX_NODES)).unwrap();
+        let mut at_limit = Tree::decode(&balanced(MAX_NODES)).unwrap();
         assert_eq!(at_limit.len(), MAX_NODES);
         assert_eq!(at_limit.level_order().len(), MAX_NODES);
         assert_eq!(

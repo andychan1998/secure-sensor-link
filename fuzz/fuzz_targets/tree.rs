@@ -12,11 +12,11 @@ use libfuzzer_sys::fuzz_target;
 use secure_sensor_link::tree::{MAX_DEPTH, MAX_NODES, Tree};
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(tree) = Tree::decode(data) else {
+    let Ok(mut tree) = Tree::decode(data) else {
         return;
     };
     let levels = tree.level_order();
-    let (nodes, root) = rebuild(&levels);
+    let (nodes, root) = rebuild(levels);
     assert!(nodes.len() <= MAX_NODES);
     assert!(depth(&nodes, root) <= MAX_DEPTH);
     let mut encoded = Vec::new();

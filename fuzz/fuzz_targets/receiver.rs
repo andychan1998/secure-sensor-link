@@ -189,6 +189,13 @@ fuzz_target!(|input: Input| {
         for camera in Camera::ALL {
             assert!(state.cameras.get(camera).pending.len() <= config.max_pending());
         }
+        // Pairing runs until one queue is empty, so frames wait for one camera
+        // at most: the bound the receiver's room for records relies on.
+        assert!(
+            Camera::ALL
+                .into_iter()
+                .any(|camera| state.cameras.get(camera).pending.is_empty())
+        );
     }
 
     let interval = u64::from(config.persist_interval());
