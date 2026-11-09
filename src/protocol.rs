@@ -11,8 +11,9 @@
 //!   written with a JSON escape sequence is refused before the JSON library
 //!   decodes it, since the decoded copy would sit in a buffer nothing erases.
 //!   Every other string may use escapes.
-//! - Error messages never repeat a value from the input, which might be a key
-//!   in the wrong place. They may name an unknown field (capped in length).
+//! - Error messages never repeat a string from the input, which might be a key
+//!   in the wrong place. They may repeat a number or a boolean (no key is
+//!   one), and name an unknown field (capped in length).
 //!
 //! The line buffer is wiped after every command, since it may hold key text.
 //! Each command runs under a panic safety net: a bug produces an "internal error"
@@ -554,10 +555,13 @@ enum CommandError {
 
 impl CommandError {
     /// A JSON parse error. serde's message can name an unknown field, so it
-    /// is capped. It never quotes a value: keys are refused by [`KeyText`],
-    /// numbers by [`whole_number`], and a line or `parameters` that isn't an
-    /// object is refused before serde sees it.
-    #[allow(clippy::needless_pass_by_value)]
+    /// is capped. It never quotes a string: keys are refused by [`KeyText`],
+    /// strings in number fields by [`whole_number`], and a line or
+    /// `parameters` that isn't an object is refused before serde sees it.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "called as `map_err(CommandError::invalid)`, which hands over the error by value"
+    )]
     fn invalid(error: serde_json::Error) -> Self {
         const LIMIT: usize = 200;
         Self::Invalid(truncate(&error.to_string(), LIMIT))

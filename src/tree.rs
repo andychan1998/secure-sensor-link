@@ -21,7 +21,10 @@ pub const MAX_DEPTH: usize = 64;
 /// Node indexes are 16-bit. A 65,535-byte payload can't hold more than 10,922
 /// nodes, so raising `MAX_NODES` never needs a wider index; this check fails the
 /// build if it ever would.
-#[allow(clippy::as_conversions)]
+#[expect(
+    clippy::as_conversions,
+    reason = "`usize::from` can't run at compile time; widening u16 to usize loses nothing"
+)]
 const _: () = assert!(MAX_NODES <= u16::MAX as usize);
 
 const ABSENT: u8 = 0x00;

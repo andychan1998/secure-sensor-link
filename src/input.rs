@@ -8,6 +8,7 @@
 //! large as it, so with stdin underneath, the input passes through no buffer
 //! that isn't erased (the operating system's pipe buffer is out of reach).
 
+use std::fmt;
 use std::io::{self, BufRead, Read};
 
 use hmac::digest::zeroize::Zeroize;
@@ -17,7 +18,6 @@ use hmac::digest::zeroize::Zeroize;
 pub const CAPACITY: usize = 64 * 1024;
 
 /// A buffered reader that erases what it has handed out.
-#[derive(Debug)]
 pub struct ErasingReader<R> {
     inner: R,
     buf: Box<[u8]>,
@@ -25,6 +25,16 @@ pub struct ErasingReader<R> {
     /// zeros.
     start: usize,
     end: usize,
+}
+
+/// Shows only how many bytes are waiting: they, and the reader underneath,
+/// may hold key text.
+impl<R> fmt::Debug for ErasingReader<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ErasingReader")
+            .field("unread", &self.end.saturating_sub(self.start))
+            .finish_non_exhaustive()
+    }
 }
 
 impl<R: Read> ErasingReader<R> {
@@ -99,6 +109,14 @@ mod tests {
         let mut reader = ErasingReader::with_capacity(4, &b"one\ntwo\nthree"[..]);
         let lines: Vec<String> = reader.by_ref().lines().map(Result::unwrap).collect();
         assert_eq!(lines, ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn debug_output_never_shows_the_input() {
+        let mut reader = ErasingReader::with_capacity(16, &b"secret,rest"[..]);
+        reader.fill_buf().unwrap();
+        reader.consume(7);
+        assert_eq!(format!("{reader:?}"), "ErasingReader { unread: 4, .. }");
     }
 
     #[test]

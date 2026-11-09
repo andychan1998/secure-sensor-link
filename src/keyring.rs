@@ -114,9 +114,13 @@ impl Keyring {
     /// The keys after a frame using `id` is accepted, or `None` if nothing
     /// changes. Using a key above the current one moves the camera to it and
     /// retires every lower key; the new keyring holds no copy of their bytes.
+    ///
+    /// Callers check `id` with [`Keyring::usable`] first. An id that isn't
+    /// usable changes nothing here either, so the current key is always one
+    /// that is provisioned and usable.
     #[must_use]
     pub fn after_use(&self, id: KeyId) -> Option<Self> {
-        if id <= self.current {
+        if id <= self.current || !matches!(self.slots.get(&id), Some(Slot::Usable(_))) {
             return None;
         }
         let mut next = self.duplicate();
@@ -263,6 +267,17 @@ mod tests {
         // Moving on again.
         let ring = ring.after_use(KeyId(5)).unwrap();
         assert_eq!(ring.usable(KeyId(2)).unwrap_err(), Unusable::Retired);
+    }
+
+    #[test]
+    fn only_a_usable_key_can_become_the_current_one() {
+        let ring = added(&Keyring::new(key(1)), 3, 3);
+        let ring = ring.with_revoked(KeyId(3)).unwrap().unwrap();
+        // Key 3 is revoked and key 7 was never provisioned: neither moves the
+        // camera, and key 0 stays current and usable.
+        assert!(ring.after_use(KeyId(3)).is_none());
+        assert!(ring.after_use(KeyId(7)).is_none());
+        assert!(ring.usable(KeyId(0)).is_ok());
     }
 
     #[test]

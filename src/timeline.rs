@@ -32,8 +32,9 @@ pub struct Corrected {
 /// later frame is compared with `T + (seq - S) * period_ms`; if it differs by
 /// more than `max_jitter_ms`, the expected value replaces it.
 ///
-/// Returns `None` only if `seq` isn't above the anchor's seq, which the replay
-/// check rules out before this is called.
+/// Returns `None` if `seq` isn't above the anchor's seq, which the replay check
+/// rules out before this is called, or if a calculation would overflow, which
+/// 128-bit timestamps make impossible for real inputs.
 #[must_use]
 pub fn correct(anchor: Option<Anchor>, seq: u32, raw: i64, config: &Config) -> Option<Corrected> {
     let raw = Millis::from(raw);

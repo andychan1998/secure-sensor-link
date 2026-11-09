@@ -20,9 +20,11 @@ pub const KEY_LEN: usize = 32;
 /// planning a change to a keyring and for storage, and each erases itself too.
 /// Its `Debug` output never shows the bytes.
 ///
-/// What safe Rust can't reach: the HMAC library holds key-derived blocks on
-/// the stack while it sets up, and the operating system's pipe buffer holds
-/// the key text that arrived on stdin.
+/// Two other places hold key material. The HMAC library sets up key-derived
+/// blocks on the stack, which safe Rust can't erase directly; the stack scrub
+/// that `protocol` runs after every command overwrites them. The operating
+/// system's pipe buffer holds the key text that arrived on stdin, and is out of
+/// reach.
 pub struct Key(Box<[u8; KEY_LEN]>);
 
 impl Key {

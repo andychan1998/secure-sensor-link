@@ -14,7 +14,10 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // Only an I/O failure (for example, stdout closed) ends the receiver.
-            #[allow(clippy::print_stderr)]
+            #[expect(
+                clippy::print_stderr,
+                reason = "with stdout gone, stderr is the only place left to report it"
+            )]
             {
                 eprintln!("secure-sensor-link: {error}");
             }
