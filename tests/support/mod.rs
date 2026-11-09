@@ -116,6 +116,36 @@ pub fn leaf(value: i32) -> Vec<u8> {
     bytes
 }
 
+/// A complete tree of `nodes` nodes, holding 0, 1, 2, … in level order: every
+/// level is full except the last, which fills from the left.
+pub fn complete_tree(nodes: usize) -> Vec<u8> {
+    fn encode(index: usize, nodes: usize, out: &mut Vec<u8>) {
+        if index >= nodes {
+            out.push(0x00);
+            return;
+        }
+        out.push(0x01);
+        out.extend_from_slice(&i32::try_from(index).unwrap().to_be_bytes());
+        encode(2 * index + 1, nodes, out);
+        encode(2 * index + 2, nodes, out);
+    }
+    let mut out = Vec::new();
+    encode(0, nodes, &mut out);
+    out
+}
+
+/// The most payload a frame can carry: `payload_len` is 16 bits.
+pub const MAX_PAYLOAD_LEN: usize = 65_535;
+
+/// A payload of [`MAX_PAYLOAD_LEN`] bytes: a complete tree with one node more
+/// than the 1,024 allowed, padded with zeros. The receiver checks its tag, then
+/// refuses the tree.
+pub fn largest_payload() -> Vec<u8> {
+    let mut payload = complete_tree(1_025);
+    payload.resize(MAX_PAYLOAD_LEN, 0x00);
+    payload
+}
+
 /// An `init` line with the spec's keys.
 pub fn init_line(period: u64, jitter: u64, window: u64, max_pending: u64) -> String {
     json!({

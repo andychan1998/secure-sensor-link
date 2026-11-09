@@ -14,8 +14,8 @@ mod support;
 
 use serde_json::{Value, json};
 use support::{
-    Frame, GET_STATE, Harness, KEY1, KEY2, add_key_line, init_line, leaf, receive_line,
-    revoke_key_line,
+    Frame, GET_STATE, Harness, KEY1, KEY2, MAX_PAYLOAD_LEN, add_key_line, complete_tree, init_line,
+    largest_payload, leaf, receive_line, revoke_key_line,
 };
 
 fn receive(harness: &mut Harness, frame: &Frame) -> Value {
@@ -163,6 +163,49 @@ fn trees_at_the_depth_limit_pass_and_deeper_ones_are_rejected() {
         reject(&mut h, &Frame::new(1, 2, 1050).payload(right_chain(65))),
         "malformed frame: tree is deeper than 64 levels"
     );
+}
+
+#[test]
+fn trees_at_the_node_limit_pass_and_larger_ones_are_rejected() {
+    // 1,024 nodes is the largest frame the receiver accepts: 6,145 bytes of payload.
+    let mut h = Harness::spec_config();
+    let full = complete_tree(1_024);
+    assert_eq!(full.len(), 6_145);
+    let ok = accept(&mut h, &Frame::new(1, 1, 1000).payload(full));
+    let level_order: Vec<Value> = (0..1_024).map(Value::from).collect();
+    assert_eq!(ok["frame"]["tree"], Value::Array(level_order));
+    assert_eq!(
+        reject(
+            &mut h,
+            &Frame::new(1, 2, 1050).payload(complete_tree(1_025))
+        ),
+        "malformed frame: tree has more than 1024 nodes"
+    );
+}
+
+#[test]
+fn the_largest_possible_frame_is_checked_and_one_byte_more_is_refused_unread() {
+    // A version 2 frame with a 65,535-byte payload: 131,168 hex characters. Its
+    // tag checks out, so the receiver gets as far as the tree.
+    let mut h = Harness::spec_config();
+    let largest = Frame::new(1, 1, 1000)
+        .v2(0, KEY1)
+        .payload(largest_payload());
+    assert_eq!(largest.payload.len(), MAX_PAYLOAD_LEN);
+    assert_eq!(largest.hex().len(), 131_168);
+    assert_eq!(
+        reject(&mut h, &largest),
+        "malformed frame: tree has more than 1024 nodes"
+    );
+    // One byte more is refused by its length, before any of it is decoded.
+    let mut too_long = largest.hex();
+    too_long.push_str("00");
+    let before = h.state();
+    assert_eq!(
+        h.error(&receive_line(&too_long)),
+        "malformed frame: 131170 hex characters is more than the 131168 maximum"
+    );
+    assert_eq!(h.state(), before);
 }
 
 // ---- Q3: a pair window wide enough to match two frames ----

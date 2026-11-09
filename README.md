@@ -55,7 +55,7 @@ Transcripts, the demo session included, are plain text: `# ` lines are comments,
 | Safety net, `tests/safety_net.rs` | `cargo test --test safety_net` | A storage fault in the middle of a command halts the receiver, and a restart recovers it | Yes |
 | Command line, `tests/cli.rs` | `cargo test --test cli` | The real binary over stdin and stdout | Yes |
 | Keys in memory, `tests/memory.rs` | `cargo test --test memory`<br>Linux only: it reads the receiver's memory through `/proc/<pid>/mem`, which macOS doesn't have, so on a Mac `cargo test` skips it | No copy of a retired or revoked key, and no key text, is left in the running receiver's memory | Yes, on Linux |
-| Soak, `tests/soak.rs` | `cargo test --test soak` | A long mixed stream through the real binary: every command gets the right kind of response within 10 seconds, memory stays flat after warming up, and it reports commands per second | Yes: 5,000 commands in debug builds, 50,000 in release |
+| Soak, `tests/soak.rs` | `cargo test --test soak` | A long mixed stream through the real binary, including full-size trees and the largest possible frame: every command gets the right kind of response within 10 seconds, memory stays flat after warming up, and it reports commands per second | Yes: 5,000 commands in debug builds, 50,000 in release |
 
 ### Tools
 

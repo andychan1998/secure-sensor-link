@@ -1,7 +1,7 @@
 //! A long run through the real binary. It sends a stream of commands mixing
-//! valid frames from both cameras, lost frames, forgeries, replays, lines that
-//! aren't JSON, state queries, key rotations, revocations and restarts, and
-//! checks that:
+//! valid frames from both cameras, full-size trees, the largest frame there can
+//! be, lost frames, forgeries, replays, lines that aren't JSON, state queries,
+//! key rotations, revocations and restarts, and checks that:
 //!
 //! - every command gets a response of the expected kind, never an internal
 //!   error, and within 10 seconds, so the receiver never hangs;
@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use support::{
-    Frame, GET_STATE, RESTART, add_key_line, init_line_with_interval, key_for, leaf, receive_line,
-    revoke_key_line,
+    Frame, GET_STATE, RESTART, add_key_line, complete_tree, init_line_with_interval, key_for,
+    largest_payload, leaf, receive_line, revoke_key_line,
 };
 
 /// Commands sent when `SOAK_COMMANDS` isn't set: fewer in debug builds, which
@@ -111,23 +111,27 @@ impl Camera {
     }
 
     /// The camera's next frame. Now and then a seq is skipped, as if lost.
-    fn next_frame(&mut self, rng: &mut Rng) -> Frame {
+    fn next_frame(&mut self, payload: Vec<u8>, rng: &mut Rng) -> Frame {
         self.seq += if rng.below(20) == 0 { 2 } else { 1 };
-        self.frame(self.seq, rng)
+        self.frame(self.seq, payload, rng)
     }
 
-    /// A frame with `seq`, signed with the camera's key.
-    fn frame(&self, seq: u32, rng: &mut Rng) -> Frame {
+    /// A frame with `seq` carrying `payload`, signed with the camera's key.
+    fn frame(&self, seq: u32, payload: Vec<u8>, rng: &mut Rng) -> Frame {
         let jitter = i64::try_from(rng.below(5)).unwrap();
         let timestamp = 1_000 + i64::from(seq) * PERIOD_MS + jitter;
-        let value = i32::try_from(rng.below(1_000)).unwrap();
-        let frame = Frame::new(self.number, seq, timestamp).payload(leaf(value));
+        let frame = Frame::new(self.number, seq, timestamp).payload(payload);
         if self.key_id == 0 {
             frame
         } else {
             frame.v2(self.key_id, &key_hex(self.number, self.key_id))
         }
     }
+}
+
+/// A one-node tree with a random value.
+fn small_tree(rng: &mut Rng) -> Vec<u8> {
+    leaf(i32::try_from(rng.below(1_000)).unwrap())
 }
 
 /// Commands on their way to the receiver, each announced to the checker first.
@@ -155,6 +159,8 @@ fn write_stream(count: u32, out: impl Write, expect: mpsc::Sender<Expect>) {
     };
     let mut rng = Rng(0x5eed_cafe_f00d_d00d);
     let mut cameras = [Camera::new(1, "cam1"), Camera::new(2, "cam2")];
+    let full_tree = complete_tree(1_024);
+    let largest = largest_payload();
 
     stream.send(
         &init_line_with_interval(u64::from(PERSIST_INTERVAL)),
@@ -169,7 +175,8 @@ fn write_stream(count: u32, out: impl Write, expect: mpsc::Sender<Expect>) {
             }
             // A forgery: the next frame with one bit of its tag flipped.
             75..=79 => {
-                let mut hex = camera.frame(camera.seq + 1, &mut rng).hex();
+                let payload = small_tree(&mut rng);
+                let mut hex = camera.frame(camera.seq + 1, payload, &mut rng).hex();
                 let last = if hex.ends_with('0') { "1" } else { "0" };
                 hex.replace_range(hex.len() - 1.., last);
                 stream.send(&receive_line(&hex), Expect::Error);
@@ -206,8 +213,23 @@ fn write_stream(count: u32, out: impl Write, expect: mpsc::Sender<Expect>) {
                     camera.seq += PERSIST_INTERVAL;
                 }
             }
+            // A full-size tree: the largest frame the receiver accepts.
+            93..=95 => {
+                let hex = camera.next_frame(full_tree.clone(), &mut rng).hex();
+                stream.send(&receive_line(&hex), Expect::Ok);
+                camera.last = Some(hex);
+            }
+            // The largest frame there can be: its tag checks out, then its tree
+            // is refused, which doesn't use up its seq.
+            96 => {
+                let hex = camera
+                    .frame(camera.seq + 1, largest.clone(), &mut rng)
+                    .hex();
+                stream.send(&receive_line(&hex), Expect::Error);
+            }
             _ => {
-                let hex = camera.next_frame(&mut rng).hex();
+                let payload = small_tree(&mut rng);
+                let hex = camera.next_frame(payload, &mut rng).hex();
                 stream.send(&receive_line(&hex), Expect::Ok);
                 camera.last = Some(hex);
             }
