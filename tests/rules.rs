@@ -250,6 +250,38 @@ fn with_a_wide_window_one_lost_frame_can_shift_every_later_pair() {
     );
 }
 
+// ---- Queue limits ----
+
+#[test]
+fn at_the_largest_queue_limit_the_oldest_is_dropped_and_one_frame_can_release_all() {
+    // max_pending 1,024 is the largest allowed. With cam2 silent, all of cam1's
+    // frames wait; the 1,025th pushes the oldest out, unpaired.
+    let mut h = Harness::default();
+    h.ok(&init_line(50, 5, 20, 1_024));
+    let timestamp = |seq: u32| 1000 + i64::from(seq) * 50;
+    for seq in 1..=1_024 {
+        let response = accept(&mut h, &Frame::new(1, seq, timestamp(seq)));
+        assert_eq!(response["synced"], json!([]));
+    }
+    let response = accept(&mut h, &Frame::new(1, 1_025, timestamp(1_025)));
+    assert_eq!(
+        response["synced"],
+        json!([{"timestamp": 1050, "cam1": 1, "cam2": null}])
+    );
+    let waiting: Vec<u32> = (2..=1_025).collect();
+    assert_eq!(h.state()["cameras"]["cam1"]["pending"], json!(waiting));
+
+    // A cam2 frame later than all of them: none of them can ever pair, so this
+    // one response releases every waiting frame, the most one frame can.
+    let response = accept(&mut h, &Frame::new(2, 1, 1_000_000));
+    let released: Vec<Value> = (2..=1_025)
+        .map(|seq| json!({"timestamp": timestamp(seq), "cam1": seq, "cam2": null}))
+        .collect();
+    assert_eq!(response["synced"], Value::Array(released));
+    assert_eq!(h.state()["cameras"]["cam1"]["pending"], json!([]));
+    assert_eq!(h.state()["cameras"]["cam2"]["pending"], json!([1]));
+}
+
 // ---- Arithmetic at the extremes ----
 
 #[test]

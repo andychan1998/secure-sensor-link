@@ -477,10 +477,15 @@ proptest! {
                     }
                     let state = harness.state();
                     prop_assert_eq!(&state, &model.state());
+                    let waiting = |cam_name: &str| {
+                        state["cameras"][cam_name]["pending"].as_array().unwrap().len()
+                    };
                     for cam_name in ["cam1", "cam2"] {
-                        let pending = state["cameras"][cam_name]["pending"].as_array().unwrap();
-                        prop_assert!(pending.len() <= cfg.max_pending);
+                        prop_assert!(waiting(cam_name) <= cfg.max_pending);
                     }
+                    // Pairing runs until one queue is empty, so frames wait
+                    // for one camera at most: never more than max_pending in all.
+                    prop_assert!(waiting("cam1") == 0 || waiting("cam2") == 0, "{}", state);
                 }
             }
         }

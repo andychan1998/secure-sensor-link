@@ -303,6 +303,31 @@ mod tests {
     }
 
     #[test]
+    fn queues_at_the_largest_limit_never_outgrow_their_reserved_room() {
+        let limit = crate::config::MAX_PENDING_LIMIT;
+        let cfg = config(20, limit);
+        let mut q = Queues::new(cfg.max_pending());
+        let room = |q: &Queues| Camera::ALL.map(|camera| q.queues.get(camera).capacity());
+        let reserved = room(&q);
+        // cam2 is silent, so cam1's queue fills to the limit and stays there.
+        for seq in 1..=1_100 {
+            add(
+                &mut q,
+                Camera::Cam1,
+                frame(seq, Millis::from(seq) * 50),
+                &cfg,
+            );
+        }
+        assert_eq!(pending(&q, Camera::Cam1), (77..=1_100).collect::<Vec<_>>());
+        // A much later cam2 frame releases every waiting frame at once.
+        let released = add(&mut q, Camera::Cam2, frame(1, 1_000_000), &cfg);
+        assert_eq!(released.len(), cfg.max_pending());
+        assert!(pending(&q, Camera::Cam1).is_empty());
+        assert_eq!(pending(&q, Camera::Cam2), vec![1]);
+        assert_eq!(room(&q), reserved);
+    }
+
+    #[test]
     fn overflow_emits_the_oldest_unpaired() {
         let cfg = config(20, 2);
         let mut q = Queues::new(2);
