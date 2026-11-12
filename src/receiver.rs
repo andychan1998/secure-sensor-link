@@ -845,6 +845,13 @@ mod tests {
     }
 
     #[test]
+    fn debug_output_never_shows_the_work_buffers() {
+        let mut r = receiver();
+        r.receive(SPEC_FRAME).unwrap();
+        assert_eq!(format!("{:?}", r.scratch), "Scratch { .. }");
+    }
+
+    #[test]
     fn a_restart_fails_cleanly_if_storage_cant_be_read() {
         let mut r = receiver();
         r.receive(SPEC_FRAME).unwrap();

@@ -154,6 +154,26 @@ fn retired_and_revoked_keys_leave_no_copies_in_memory() {
     // nowhere else.
     assert_eq!(halves(raw(CAM1_KEY2)), [2, 2], "cam1 key 2 (active)");
 
+    // Still nowhere else right after a frame is checked with it. A release
+    // build leaves a copy of the key on the stack while checking a frame, and
+    // only the stack scrub after each command removes it. A debug build leaves
+    // none, so only a release run of this test can tell the scrub is missing.
+    writeln!(
+        stdin,
+        "{}",
+        receive_line(&Frame::new(1, 3, 1100).v2(2, CAM1_KEY2).hex())
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let mut response = String::new();
+    stdout.read_line(&mut response).unwrap();
+    assert!(response.contains(r#""status":"ok""#), "{response}");
+    assert_eq!(
+        halves(raw(CAM1_KEY2)),
+        [2, 2],
+        "cam1 key 2 (active), right after checking a frame"
+    );
+
     drop(stdin);
     assert!(child.wait().unwrap().success());
 }

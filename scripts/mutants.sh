@@ -15,6 +15,11 @@
 #   the stack after each command. Only tests/memory.rs can see them, by
 #   reading the running receiver's memory, and it runs on Linux only. On
 #   Linux they must be caught; elsewhere they're listed as not checkable.
+# - The stack ones need a release build: only an optimized build leaves a
+#   copy of a key on the stack for the scrub to remove, so in the debug build
+#   cargo mutants uses, removing the scrub changes nothing. On Linux, any of
+#   them missed there are tested again with a release build, and must be
+#   caught there.
 set -u
 
 cd "$(dirname "$0")/.."
@@ -41,11 +46,13 @@ count() {
     fi
 }
 
-# The mutants only tests/memory.rs can catch, as patterns for grep -E.
+# The mutants only tests/memory.rs can catch, as patterns for grep -E, and
+# among them the ones that need a release build.
 scrub_len_line=$(grep -n 'const STACK_SCRUB_LEN' src/protocol.rs | cut -d: -f1)
-linux_only="replace <impl Drop for Key>::drop with \(\)\$
-replace scrub_stack with \(\)\$
+release_only="replace scrub_stack with \(\)\$
 ^src/protocol\.rs:$scrub_len_line:"
+linux_only="replace <impl Drop for Key>::drop with \(\)\$
+$release_only"
 
 platform=$(uname -s)
 case $platform in
@@ -53,11 +60,33 @@ Darwin) platform=macOS ;;
 esac
 missed_file=$(mktemp)
 patterns=$(mktemp)
-trap 'rm -f "$missed_file" "$patterns"' EXIT
+release_patterns=$(mktemp)
+trap 'rm -f "$missed_file" "$patterns" "$release_patterns"' EXIT
 printf '%s\n' "$linux_only" >"$patterns"
+printf '%s\n' "$release_only" >"$release_patterns"
 touch "$out/missed.txt"
+release_caught=0
 if [ "$platform" = Linux ]; then
-    cp "$out/missed.txt" "$missed_file"
+    grep -v -E -f "$release_patterns" "$out/missed.txt" >"$missed_file" || true
+    if grep -q -E -f "$release_patterns" "$out/missed.txt"; then
+        echo
+        echo "Testing the stack scrub's mutants again with a release build:"
+        release_out="$out/release"
+        cargo mutants --profile release -F "$(paste -s -d '|' "$release_patterns")" \
+            --output "$release_out"
+        case $? in
+        0 | 2 | 3) ;;
+        *)
+            echo
+            echo "FAIL: the release build run of cargo mutants stopped before finishing."
+            exit 1
+            ;;
+        esac
+        release_dir="$release_out/mutants.out"
+        release_caught=$(cat "$release_dir/caught.txt" "$release_dir/timeout.txt" 2>/dev/null |
+            wc -l | tr -d ' ')
+        cat "$release_dir/missed.txt" >>"$missed_file" 2>/dev/null || true
+    fi
     unchecked=''
 else
     grep -v -E -f "$patterns" "$out/missed.txt" >"$missed_file" || true
@@ -69,6 +98,10 @@ echo
 echo "Mutation testing on $platform: $(count caught.txt) caught, $(count timeout.txt) timed out" \
     "(also caught: the tests hung and were stopped), $(count unviable.txt) didn't compile," \
     "$missed missed."
+if [ "$release_caught" -gt 0 ]; then
+    echo "Of the stack scrub's mutants missed in the debug build, $release_caught were caught" \
+        "by a release build, the only kind that leaves a key on the stack to scrub."
+fi
 if [ -n "$unchecked" ]; then
     echo
     echo "Not checkable on $platform: these weaken memory erasure, and only tests/memory.rs,"
