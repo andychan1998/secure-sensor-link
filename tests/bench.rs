@@ -2,10 +2,14 @@
 //! A plain `cargo test` skips it; run it with
 //!
 //! ```text
-//! scripts/bench.sh
+//! scripts/bench.sh                     # all three cases, one after another
+//! scripts/bench.sh small_frames        # or just one of them
+//! scripts/bench.sh largest_accepted_frames
+//! scripts/bench.sh largest_possible_frames
 //! ```
 //!
-//! which runs `cargo test --release --test bench -- --ignored --nocapture`.
+//! The script runs `cargo test --release --test bench -- --ignored --nocapture
+//! --test-threads=1`, one case at a time so they don't compete for the CPU.
 //!
 //! Each case sends `init`, then a stream of one kind of frame, alternating
 //! between the cameras so that accepted frames pair, three times:
@@ -117,51 +121,61 @@ fn run(input: &[u8]) -> (Duration, u32, u32) {
     (elapsed, responses, ok)
 }
 
-#[test]
-#[ignore = "a benchmark: run it with scripts/bench.sh"]
+/// Measures one case, three runs, and prints each run's figures.
 #[expect(
     clippy::print_stderr,
     reason = "the figures are the benchmark's report"
 )]
-fn throughput_for_each_kind_of_frame() {
-    let cases = [
-        Case {
-            name: "small frames (one-node tree)",
-            payload: leaf(7),
-            frames: 300_000,
-            accepted: true,
-        },
-        Case {
-            name: "largest accepted frames (1,024-node tree)",
-            payload: complete_tree(1_024),
-            frames: 10_000,
-            accepted: true,
-        },
-        Case {
-            name: "largest possible frames (tag checked, tree refused)",
-            payload: largest_payload(),
-            frames: 2_000,
-            accepted: false,
-        },
-    ];
-    for case in &cases {
-        let (input, frame_len) = input(case);
+fn measure(case: &Case) {
+    let (input, frame_len) = input(case);
+    eprintln!(
+        "{}: {frame_len} bytes each, {} frames",
+        case.name, case.frames
+    );
+    for _ in 0..RUNS {
+        let (elapsed, responses, ok) = run(&input);
+        assert_eq!(responses, case.frames + 1, "one response per line");
+        let expected_ok = if case.accepted { case.frames + 1 } else { 1 };
+        assert_eq!(ok, expected_ok, "{}: unexpected refusals", case.name);
+        let seconds = elapsed.as_secs_f64();
         eprintln!(
-            "{}: {frame_len} bytes each, {} frames",
-            case.name, case.frames
+            "  {:.0} frames per second, {:.1} µs per frame ({:.2} s)",
+            f64::from(case.frames) / seconds,
+            seconds * 1e6 / f64::from(case.frames),
+            seconds,
         );
-        for _ in 0..RUNS {
-            let (elapsed, responses, ok) = run(&input);
-            assert_eq!(responses, case.frames + 1, "one response per line");
-            let expected_ok = if case.accepted { case.frames + 1 } else { 1 };
-            assert_eq!(ok, expected_ok, "{}: unexpected refusals", case.name);
-            let seconds = elapsed.as_secs_f64();
-            eprintln!(
-                "  {:.0} frames per second, {:.1} µs per frame ({:.2} s)",
-                f64::from(case.frames) / seconds,
-                seconds * 1e6 / f64::from(case.frames),
-                seconds,
-            );
-        }
     }
+}
+
+#[test]
+#[ignore = "a benchmark: run it with scripts/bench.sh"]
+fn small_frames() {
+    measure(&Case {
+        name: "small frames (one-node tree)",
+        payload: leaf(7),
+        frames: 300_000,
+        accepted: true,
+    });
+}
+
+#[test]
+#[ignore = "a benchmark: run it with scripts/bench.sh"]
+fn largest_accepted_frames() {
+    measure(&Case {
+        name: "largest accepted frames (1,024-node tree)",
+        payload: complete_tree(1_024),
+        frames: 10_000,
+        accepted: true,
+    });
+}
+
+#[test]
+#[ignore = "a benchmark: run it with scripts/bench.sh"]
+fn largest_possible_frames() {
+    measure(&Case {
+        name: "largest possible frames (tag checked, tree refused)",
+        payload: largest_payload(),
+        frames: 2_000,
+        accepted: false,
+    });
 }
