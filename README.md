@@ -84,6 +84,8 @@ fuzz/run.sh receiver 3600                                                # secon
 
 **Property tests and fuzzing.** Both use random input. A property test builds realistic command sequences from a recipe, checks a rule against every one, and when one fails, shrinks it to the smallest sequence that still fails. Fuzzing mutates raw bytes for as long as you let it, steering toward input that reaches new code.
 
+**Throughput.** `scripts/bench.sh` sends one kind of frame at a time straight through the release binary, three runs each: small frames, the largest frames the receiver accepts (a 1,024-node tree), and the largest frames possible (the tag is checked, then the tree is refused). It reports frames per second and the time per frame. It lives in `tests/bench.rs`, which a plain `cargo test` skips, and takes about half a minute. The figures depend on the machine, so run it on an idle one.
+
 ## Layout
 
 ```
@@ -107,6 +109,7 @@ tests/          the tests in the table above, and their shared helpers in suppor
 fuzz/           fuzz targets, seeds and dictionary (a separate crate)
 demo/           the presentation demo: run.sh and the session it plays
 scripts/        mutants.sh: mutation testing, with a pass or fail for this platform
+                bench.sh: throughput, one kind of frame at a time
 ```
 
 ## Stages
