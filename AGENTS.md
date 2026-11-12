@@ -32,7 +32,9 @@ For a change to parsing, the frame checks or the receiver's state, also run the
 matching fuzz target (`fuzz/run.sh command_line|receiver|tree 600`) and mutation
 testing on the change (`git diff > /tmp/change.diff`, then
 `scripts/mutants.sh --in-diff /tmp/change.diff`). `tests/memory.rs` runs on Linux
-only; a change to key handling or erasure needs a Linux run.
+only; a change to key handling or erasure needs a Linux run, in release too
+(`cargo test --release --test memory`): only a release build can show a missing
+stack scrub.
 
 ## Invariants to keep
 

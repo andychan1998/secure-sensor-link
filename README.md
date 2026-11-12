@@ -54,7 +54,7 @@ Transcripts, the demo session included, are plain text: `# ` lines are comments,
 | Reference model, `tests/model.rs` | `cargo test --test model` | Property tests: random command sequences get exactly the responses of a separate, plain implementation of the spec, and random lines and frame bytes never cause an internal error | Yes |
 | Safety net, `tests/safety_net.rs` | `cargo test --test safety_net` | A storage fault in the middle of a command halts the receiver, and a restart recovers it | Yes |
 | Command line, `tests/cli.rs` | `cargo test --test cli` | The real binary over stdin and stdout | Yes |
-| Keys in memory, `tests/memory.rs` | `cargo test --test memory`<br>Linux only: it reads the receiver's memory through `/proc/<pid>/mem`, which macOS doesn't have, so on a Mac `cargo test` skips it | No copy of a retired or revoked key, and no key text, is left in the running receiver's memory | Yes, on Linux |
+| Keys in memory, `tests/memory.rs` | `cargo test --test memory`<br>Linux only: it reads the receiver's memory through `/proc/<pid>/mem`, which macOS doesn't have, so on a Mac `cargo test` skips it | No copy of a retired or revoked key, and no key text, is left in the running receiver's memory<br>Run as a release build (`--release`), it also checks the stack scrub: right after a frame is checked, the active key is nowhere else. Only a release build leaves a copy of the key on the stack for the scrub to erase | Yes, on Linux |
 | Soak, `tests/soak.rs` | `cargo test --test soak` | A long mixed stream through the real binary, including full-size trees and the largest possible frame: every command gets the right kind of response within 10 seconds, memory stays flat after warming up, and it reports commands per second | Yes: 5,000 commands in debug builds, 50,000 in release |
 
 ### Tools
@@ -70,16 +70,17 @@ Coverage and mutation testing check the tests themselves: which code they run, a
 
 ### CI
 
-CI runs on every push and pull request (`.github/workflows/ci.yml`). It runs the tests on Linux and on macOS, each as a debug and a release build, and also checks formatting (`cargo fmt --check`), lints (`cargo clippy`) and the docs (`cargo doc`).
+CI runs on every push and pull request (`.github/workflows/ci.yml`). It runs the tests on Linux and on macOS, each as a debug and a release build, and also checks formatting (`cargo fmt --check`), lints (`cargo clippy`) and the docs (`cargo doc`). Coverage, fuzzing and the dependency check run on Linux only.
 
 ### Notes
 
 **Longer runs.** The property tests, the soak test and fuzzing all take a size:
 
 ```
-PROPTEST_CASES=100000 cargo test --release --test model                  # random cases per property test (default 400)
+PROPTEST_CASES=100000 cargo test --release --test model                 # random cases per property test (default 400)
+PROPTEST_CASES=100000 cargo test --release --test restart               # the same for the twin test (default 500)
 SOAK_COMMANDS=1000000 cargo test --release --test soak -- --nocapture   # commands; prints commands per second
-fuzz/run.sh receiver 3600                                                # seconds of fuzzing
+fuzz/run.sh receiver 3600                                               # seconds of fuzzing
 ```
 
 **Property tests and fuzzing.** Both use random input. A property test builds realistic command sequences from a recipe, checks a rule against every one, and when one fails, shrinks it to the smallest sequence that still fails. Fuzzing mutates raw bytes for as long as you let it, steering toward input that reaches new code.
@@ -105,9 +106,11 @@ src/
   timeline.rs   timestamp correction, in exact 128-bit arithmetic
   sync.rs       per-camera queues and pairing
   camera.rs     the two cameras, and one value per camera
-tests/          the tests in the table above, and their shared helpers in support/
+tests/          the tests in the table above, their shared helpers in support/,
+                the spec's example transcripts in transcripts/, and the benchmark in bench.rs
 fuzz/           fuzz targets, seeds and dictionary (a separate crate)
 demo/           the presentation demo: run.sh and the session it plays
+docs/           the diagrams in DESIGN.md
 scripts/        mutants.sh: mutation testing, with a pass or fail for this platform
                 bench.sh: throughput, one kind of frame at a time
 ```
@@ -122,7 +125,7 @@ The project was built in the spec's three stages, and each finished stage is tag
 | `v2-keys` | Follow-on 1 | Key rotation and revocation: version 2 frames with a key id, `add_key` and `revoke_key` |
 | `v3-restart` | Follow-on 2 | `restart` and `persist_interval`: replay protection that survives a restart, within the storage write budget |
 
-`main` builds on `v3-restart` with CI, fuzzing, the fixes from an independent security review, the demo and the soak test.
+`main` builds on `v3-restart` with CI, fuzzing, mutation testing, the fixes from an independent security review and a code review, the demo, the soak test, tests at the size limits, work buffers reserved once and reused, the throughput benchmark, and rules for AI coding agents (`AGENTS.md`).
 
 ```
 git checkout v2-keys        # look at a stage; git checkout main to come back
