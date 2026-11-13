@@ -44,7 +44,9 @@ stack scrub.
 - **A rejected frame changes nothing.** `Receiver::plan` gets memory read-only.
   Every effect happens in the commit: storage first, then memory, with the
   commit-in-progress flag set. The one exception is the key move for a frame
-  refused only by the restart floor.
+  refused only by the restart floor. If a panic interrupts a commit, the flag
+  stays set, and the receiver rebuilds memory from storage before its next
+  command (`Receiver::recover`).
 - **Restarts:** the floor (seq + `persist_interval`) is saved before accepting a
   seq past it, and floor writes per camera stay within the spec's budget.
 - **Keys:** `Key` has no `Clone`; copies only through `Key::duplicate`, and every

@@ -12,8 +12,8 @@
 //!   decodes it, since the decoded copy would sit in a buffer nothing erases.
 //!   Every other string may use escapes.
 //! - Error messages never repeat a string from the input, which might be a key
-//!   in the wrong place. They may repeat a number or a boolean (no key is
-//!   one), and name an unknown field (capped in length).
+//!   in the wrong place, not even an unknown field's name. They may repeat a
+//!   number or a boolean (no key is one).
 //!
 //! The line buffer is wiped after every command, since it may hold key text.
 //! Each command runs under a panic safety net: a bug produces an "internal error"
@@ -85,7 +85,7 @@ impl<S: Storage + Default> Session<S> {
     pub fn handle_line(&mut self, line: &[u8]) -> Response<'_> {
         // A panic in planning leaves the state untouched, so carrying on is
         // safe. A panic during a commit is detected by the receiver itself,
-        // which then refuses changes until a restart.
+        // which rebuilds its memory from storage before the next command.
         panic::catch_unwind(AssertUnwindSafe(move || {
             // Moving the session in makes this closure run only once, which
             // lets the response it returns borrow from the session.
@@ -118,7 +118,11 @@ impl<S: Storage + Default> Session<S> {
             }
             "get_state" => {
                 let NoParams {} = parse(parameters)?;
-                Ok(Payload::State(self.receiver()?.state()))
+                let receiver = self.receiver_mut()?;
+                // Report rebuilt memory after an interrupted commit. If storage
+                // can't be read, report memory as it is, for diagnosis.
+                receiver.recover();
+                Ok(Payload::State(receiver.state()))
             }
             "add_key" => {
                 let params: AddKeyParams<'_> = parse(parameters)?;
@@ -167,10 +171,6 @@ impl<S: Storage + Default> Session<S> {
         let state = receiver.state();
         self.receiver = Some(receiver);
         Ok(Payload::State(state))
-    }
-
-    fn receiver(&self) -> Result<&Receiver<S>, CommandError> {
-        self.receiver.as_ref().ok_or(CommandError::NotInitialized)
     }
 
     fn receiver_mut(&mut self) -> Result<&mut Receiver<S>, CommandError> {
@@ -243,14 +243,27 @@ fn optional_whole_number<'de, D: Deserializer<'de>>(
     whole_number(deserializer).map(Some)
 }
 
-/// `text` cut to at most `limit` characters, marked with "..." if it was cut.
-/// Error messages built from input stay small, however large the input line.
-fn truncate(text: &str, limit: usize) -> String {
-    let mut short: String = text.chars().take(limit).collect();
-    if short.len() < text.len() {
-        short.push_str("...");
+/// serde's message for an unknown field quotes the field's name, which comes
+/// from the input and could be a key typed in the wrong place. Removes the
+/// name and keeps what serde adds after it: the fields it expected, and where
+/// in the line. Any other message is returned as it is.
+fn without_field_name(message: String) -> String {
+    let Some(rest) = message.strip_prefix("unknown field `") else {
+        return message;
+    };
+    // The name ends where serde's own text starts. The name may contain that
+    // text too, but nothing after the last match comes from the input.
+    let end = ["`, expected ", "`, there are no fields"]
+        .iter()
+        .filter_map(|marker| rest.rfind(marker))
+        .max();
+    match end
+        .and_then(|end| rest.get(end..))
+        .and_then(|after| after.strip_prefix('`'))
+    {
+        Some(after) => format!("unknown field{after}"),
+        None => "unknown field".to_owned(),
     }
-    short
 }
 
 /// How much of the stack [`scrub_stack`] overwrites: more than any command
@@ -554,17 +567,17 @@ enum CommandError {
 }
 
 impl CommandError {
-    /// A JSON parse error. serde's message can name an unknown field, so it
-    /// is capped. It never quotes a string: keys are refused by [`KeyText`],
-    /// strings in number fields by [`whole_number`], and a line or
-    /// `parameters` that isn't an object is refused before serde sees it.
+    /// A JSON parse error. Its message never quotes a string from the input:
+    /// an unknown field's name is removed ([`without_field_name`]), keys are
+    /// refused by [`KeyText`], strings in number fields by [`whole_number`],
+    /// and a line or `parameters` that isn't an object is refused before serde
+    /// sees it.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "called as `map_err(CommandError::invalid)`, which hands over the error by value"
     )]
     fn invalid(error: serde_json::Error) -> Self {
-        const LIMIT: usize = 200;
-        Self::Invalid(truncate(&error.to_string(), LIMIT))
+        Self::Invalid(without_field_name(error.to_string()))
     }
 }
 
@@ -767,20 +780,44 @@ mod tests {
     }
 
     #[test]
-    fn truncates_by_characters() {
-        assert_eq!(truncate("short", 32), "short");
-        assert_eq!(truncate(&"x".repeat(32), 32), "x".repeat(32));
-        let long = "x".repeat(100);
-        assert_eq!(truncate(&long, 32), format!("{}...", "x".repeat(32)));
-        // Counts characters, not bytes.
+    fn removes_an_unknown_field_name_and_keeps_the_rest() {
+        let strip = |message: &str| without_field_name(message.to_owned());
         assert_eq!(
-            truncate(&"é".repeat(40), 32),
-            format!("{}...", "é".repeat(32))
+            strip(
+                "unknown field `q`, expected one of `camera`, `key_id`, `key` at line 1 column 42"
+            ),
+            "unknown field, expected one of `camera`, `key_id`, `key` at line 1 column 42"
+        );
+        assert_eq!(
+            strip("unknown field `q`, expected `cam1` or `cam2` at line 1 column 17"),
+            "unknown field, expected `cam1` or `cam2` at line 1 column 17"
+        );
+        assert_eq!(
+            strip("unknown field `q`, there are no fields at line 1 column 19"),
+            "unknown field, there are no fields at line 1 column 19"
+        );
+        // A name that contains serde's own text: the real text is the last.
+        assert_eq!(
+            strip("unknown field `a`, expected b`, there are no fields at line 1 column 9"),
+            "unknown field, there are no fields at line 1 column 9"
+        );
+        assert_eq!(
+            strip(
+                "unknown field `a`, there are no fields`, expected `x` or `y` at line 1 column 9"
+            ),
+            "unknown field, expected `x` or `y` at line 1 column 9"
+        );
+        // A shape serde doesn't produce: nothing after the name is kept.
+        assert_eq!(strip("unknown field `secret"), "unknown field");
+        // Other messages name only the code's own fields, and pass through.
+        assert_eq!(
+            strip("duplicate field `command` at line 1 column 48"),
+            "duplicate field `command` at line 1 column 48"
         );
     }
 
     #[test]
-    fn json_errors_naming_an_unknown_field_are_capped() {
+    fn json_errors_never_name_an_unknown_field() {
         let mut session: Session = Session::default();
         let long = "y".repeat(10_000);
         let unknown_field = format!(r#"{{"command":"get_state","parameters":{{}},"{long}":1}}"#);
@@ -788,9 +825,11 @@ mod tests {
         for line in [unknown_field, unknown_parameter] {
             let response = serde_json::to_value(session.handle_line(line.as_bytes())).unwrap();
             let message = response["payload"]["message"].as_str().unwrap();
-            assert!(message.starts_with("invalid command: "), "{message}");
-            assert!(message.ends_with("yyy..."), "{message}");
-            assert_eq!(message.chars().count(), "invalid command: ".len() + 200 + 3);
+            assert!(
+                message.starts_with("invalid command: unknown field, "),
+                "{message}"
+            );
+            assert!(!message.contains("yyy"), "{message}");
         }
     }
 

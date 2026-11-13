@@ -1,10 +1,11 @@
-//! No copy of a retired or revoked key is left in the receiver's memory, and no
-//! key's hex text is either.
+//! No copy of a retired or revoked key is left in the receiver's memory, in
+//! any form HMAC derives from it either, and no key's hex text is either.
 //!
 //! Runs the real receiver, retires and revokes keys through the protocol, then
 //! reads the receiver's memory through `/proc` (Linux only) and counts copies
 //! of each key. The active key must still be found, which shows the scan
-//! really reads the receiver's memory.
+//! really reads the receiver's memory; and the scan must find the states of an
+//! HMAC in use in another process, which shows it would find a derived form.
 
 #![cfg(target_os = "linux")]
 #![allow(
@@ -22,6 +23,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::process::{Command, Stdio};
 
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
+use sha2::block_api::compress256;
 use support::{Frame, add_key_line, receive_line, revoke_key_line};
 
 /// Distinctive keys, never all one byte value.
@@ -38,6 +42,131 @@ fn init_line() -> String {
     format!(
         r#"{{"command":"init","parameters":{{"period_ms":50,"max_jitter_ms":5,"pair_window_ms":20,"max_pending":4,"keys":{{"cam1":"{CAM1_KEY0}","cam2":"{CAM2_KEY0}"}}}}}}"#
     )
+}
+
+/// SHA-256's starting state.
+const SHA256_IV: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
+
+/// The SHA-256 state after hashing `block` from the start, as it sits in
+/// memory: eight 32-bit words in this machine's byte order.
+fn state_after(block: &[u8; 64]) -> [u32; 8] {
+    let mut state = SHA256_IV;
+    compress256(&mut state, &[*block]);
+    state
+}
+
+/// A 32-byte key padded to one 64-byte block, combined with `pad` by XOR.
+fn padded(key: &[u8], pad: u8) -> [u8; 64] {
+    let mut block = [pad; 64];
+    for (byte, k) in block.iter_mut().zip(key) {
+        *byte ^= k;
+    }
+    block
+}
+
+/// What HMAC-SHA256 derives from a key, each as good as the key itself: the
+/// key combined by XOR with the inner (0x36) and outer (0x5c) pads, and the
+/// SHA-256 state after hashing each padded block, which the HMAC keeps for the
+/// whole time it is in use. Only the key's half of each padded block is
+/// searched for; the other half is the pad alone.
+fn derived_forms(key: &[u8]) -> [(&'static str, Vec<u8>); 4] {
+    let (inner, outer) = (padded(key, 0x36), padded(key, 0x5c));
+    let bytes = |state: [u32; 8]| state.iter().flat_map(|word| word.to_ne_bytes()).collect();
+    [
+        ("key XOR inner pad", inner[..32].to_vec()),
+        ("key XOR outer pad", outer[..32].to_vec()),
+        ("inner SHA-256 state", bytes(state_after(&inner))),
+        ("outer SHA-256 state", bytes(state_after(&outer))),
+    ]
+}
+
+/// The derived forms above are the real ones: an HMAC finished from the two
+/// states gives the same tag as the HMAC library.
+#[test]
+fn derived_forms_are_what_hmac_uses() {
+    /// Continues SHA-256 from `state`, after one 64-byte block, over `message`.
+    fn finish(mut state: [u32; 8], message: &[u8]) -> [u8; 32] {
+        let mut tail = message.to_vec();
+        tail.push(0x80);
+        while tail.len() % 64 != 56 {
+            tail.push(0);
+        }
+        let bits = (64 + u64::try_from(message.len()).unwrap()) * 8;
+        tail.extend_from_slice(&bits.to_be_bytes());
+        let blocks: Vec<[u8; 64]> = tail.chunks(64).map(|c| c.try_into().unwrap()).collect();
+        compress256(&mut state, &blocks);
+        let mut out = [0; 32];
+        for (chunk, word) in out.chunks_mut(4).zip(state) {
+            chunk.copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+    let key = hex::decode(CAM1_KEY0).unwrap();
+    let message = b"a frame's bytes";
+    let inner = finish(state_after(&padded(&key, 0x36)), message);
+    let tag = finish(state_after(&padded(&key, 0x5c)), &inner);
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+    mac.update(message);
+    assert_eq!(tag, mac.finalize().into_bytes()[..]);
+}
+
+/// Run in a child process by `the_search_finds_the_states_of_a_live_hmac`:
+/// keeps an HMAC in use until its stdin closes. Does nothing otherwise.
+#[test]
+#[ignore = "run by the_search_finds_the_states_of_a_live_hmac"]
+fn hold_an_hmac_while_stdin_is_open() {
+    if std::env::var_os("HOLD_HMAC").is_none() {
+        return;
+    }
+    let mac = Hmac::<Sha256>::new_from_slice(&hex::decode(CAM2_KEY0).unwrap()).unwrap();
+    let mut stdout = std::io::stdout();
+    writeln!(stdout, "ready").unwrap();
+    stdout.flush().unwrap();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).unwrap();
+    std::hint::black_box(&mac);
+}
+
+/// The search below does find an HMAC's states while one is in use, so
+/// finding none of a retired or revoked key's means there are none.
+#[test]
+fn the_search_finds_the_states_of_a_live_hmac() {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hold_an_hmac_while_stdin_is_open",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("HOLD_HMAC", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while line.trim() != "ready" {
+        line.clear();
+        assert_ne!(
+            stdout.read_line(&mut line).unwrap(),
+            0,
+            "the child ended early"
+        );
+    }
+    for (form, bytes) in &derived_forms(&hex::decode(CAM2_KEY0).unwrap())[2..] {
+        assert!(copies_in_memory(child.id(), bytes) >= 1, "{form} not found");
+    }
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
 }
 
 /// How many times `needle` appears in the readable memory of process `pid`.
@@ -139,6 +268,9 @@ fn retired_and_revoked_keys_leave_no_copies_in_memory() {
         ("refused key", REFUSED_KEY),
     ] {
         assert_eq!(halves(raw(key)), [0, 0], "{name}: bytes");
+        for (form, bytes) in derived_forms(&raw(key)) {
+            assert_eq!(halves(bytes), [0, 0], "{name}: {form}");
+        }
     }
     for key in [
         CAM1_KEY0,

@@ -543,4 +543,121 @@ mod tests {
             "internal error while decoding the tree"
         );
     }
+
+    /// A tree built outside the decoder: each node's value and children.
+    struct Model {
+        nodes: Vec<(i32, Option<usize>, Option<usize>)>,
+    }
+
+    impl Model {
+        /// A tree of `values.len()` nodes, at most `MAX_DEPTH` deep. Node `i`
+        /// goes into a free child slot picked by `choices[i]`: one of the two
+        /// below the node added just before, `bias` percent of the time when
+        /// that is still allowed (which grows long chains), otherwise any.
+        fn build(values: &[i32], choices: &[u32], bias: u32) -> Self {
+            let mut nodes: Vec<(i32, Option<usize>, Option<usize>)> = Vec::new();
+            // Child slots still free and within the depth limit:
+            // (parent, is right child, depth of the child).
+            let mut free: Vec<(usize, bool, usize)> = Vec::new();
+            for (i, (&value, &choice)) in values.iter().zip(choices).enumerate() {
+                let depth = if i == 0 {
+                    1
+                } else {
+                    // The node added just before left its free slots last.
+                    let side = usize::from(choice & 0x1_0000 != 0);
+                    let below_last = free
+                        .len()
+                        .checked_sub(1 + side)
+                        .filter(|&slot| free[slot].0 == i - 1);
+                    let slot = match below_last {
+                        Some(slot) if choice % 100 < bias => slot,
+                        _ => usize::try_from(choice / 100).unwrap() % free.len(),
+                    };
+                    let (parent, right, depth) = free.swap_remove(slot);
+                    if right {
+                        nodes[parent].2 = Some(i);
+                    } else {
+                        nodes[parent].1 = Some(i);
+                    }
+                    depth
+                };
+                nodes.push((value, None, None));
+                if depth < MAX_DEPTH {
+                    free.push((i, false, depth + 1));
+                    free.push((i, true, depth + 1));
+                }
+            }
+            Self { nodes }
+        }
+
+        /// The spec's preorder encoding.
+        fn encode(&self) -> Vec<u8> {
+            fn subtree(model: &Model, index: Option<usize>, out: &mut Vec<u8>) {
+                match index {
+                    None => out.push(ABSENT),
+                    Some(i) => {
+                        let (value, left, right) = model.nodes[i];
+                        out.extend(node(value));
+                        subtree(model, left, out);
+                        subtree(model, right, out);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            subtree(self, (!self.nodes.is_empty()).then_some(0), &mut out);
+            out
+        }
+
+        /// The spec's level order: `None` for each missing child of a present
+        /// node, trailing `None`s removed.
+        fn level_order(&self) -> Vec<Option<i32>> {
+            let mut queue =
+                std::collections::VecDeque::from([(!self.nodes.is_empty()).then_some(0)]);
+            let mut out = Vec::new();
+            while let Some(entry) = queue.pop_front() {
+                match entry {
+                    None => out.push(None),
+                    Some(i) => {
+                        let (value, left, right) = self.nodes[i];
+                        out.push(Some(value));
+                        queue.push_back(left);
+                        queue.push_back(right);
+                    }
+                }
+            }
+            while out.last() == Some(&None) {
+                out.pop();
+            }
+            out
+        }
+    }
+
+    proptest::proptest! {
+        /// Every tree within the limits is accepted and comes back in the
+        /// right level order, however it is shaped: bushy, a long chain, or in
+        /// between, up to exactly `MAX_NODES` nodes and `MAX_DEPTH` levels.
+        #[test]
+        fn every_tree_within_the_limits_decodes_to_its_level_order(
+            values in proptest::prop_oneof![
+                9 => proptest::collection::vec(proptest::num::i32::ANY, 0..=MAX_NODES),
+                1 => proptest::collection::vec(proptest::num::i32::ANY, MAX_NODES),
+            ],
+            choices in proptest::collection::vec(proptest::num::u32::ANY, MAX_NODES),
+            bias in 0_u32..=100,
+        ) {
+            let model = Model::build(&values, &choices, bias);
+            let bytes = model.encode();
+            let expected = model.level_order();
+
+            let mut tree = Tree::decode(&bytes).unwrap();
+            proptest::prop_assert_eq!(tree.len(), values.len());
+            proptest::prop_assert_eq!(tree.level_order(), &expected[..]);
+
+            // And the same through a reused full-capacity tree.
+            let mut reused = Tree::with_full_capacity();
+            reused.decode_from(&[node(7), vec![ABSENT, ABSENT]].concat()).unwrap();
+            reused.decode_from(&bytes).unwrap();
+            proptest::prop_assert_eq!(reused.level_order(), &expected[..]);
+        }
+    }
 }

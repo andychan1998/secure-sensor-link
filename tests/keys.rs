@@ -343,7 +343,7 @@ fn add_key_parameters_are_checked() {
             r#"{{"command":"add_key","parameters":{{"camera":"cam1","key_id":1,"key":"{}","extra":1}}}}"#,
             key(1)
         ))
-        .starts_with("invalid command: unknown field `extra`")
+        .starts_with("invalid command: unknown field, expected one of `camera`, `key_id`, `key`")
     );
     assert!(
         h.error(&format!(

@@ -573,6 +573,15 @@ fn no_value_from_the_input_is_ever_repeated() {
         let escaped = with_value(&init, &["parameters", "keys", camera], json!("ESCAPED"));
         fresh.push(escaped.replace("ESCAPED", &escaped_secret));
     }
+    // The secret as a field name: at the top level, in init's parameters, and
+    // in its keys.
+    fresh.push(with_value(&init, &[SECRET], json!(1)));
+    fresh.push(with_value(&init, &["parameters", SECRET], json!(1)));
+    fresh.push(with_value(
+        &init,
+        &["parameters", "keys", SECRET],
+        json!("cam1"),
+    ));
     for line in &fresh {
         let mut h = Harness::default();
         assert_not_echoed(&h.send(line), line);
@@ -599,6 +608,16 @@ fn no_value_from_the_input_is_ever_repeated() {
     ];
     let escaped = with_value(&add_key, &["parameters", "key"], json!("ESCAPED"));
     later.push(escaped.replace("ESCAPED", &escaped_secret));
+    // The secret as a field name of each later command, and of its parameters.
+    for line in [
+        &add_key,
+        &revoke_key,
+        &receive_line(SECRET),
+        &GET_STATE.to_owned(),
+    ] {
+        later.push(with_value(line, &[SECRET], json!(1)));
+        later.push(with_value(line, &["parameters", SECRET], json!(1)));
+    }
     let mut h = Harness::spec_config();
     for line in &later {
         assert_not_echoed(&h.send(line), line);

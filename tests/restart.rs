@@ -74,7 +74,7 @@ fn restart_needs_init_and_takes_no_parameters() {
     let mut h = Harness::spec_config();
     assert!(
         h.error(r#"{"command":"restart","parameters":{"now":true}}"#)
-            .starts_with("invalid command: unknown field `now`")
+            .starts_with("invalid command: unknown field, there are no fields")
     );
     assert_eq!(
         h.error(r#"{"command":"restart","parameters":[]}"#),

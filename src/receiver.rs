@@ -12,10 +12,9 @@
 //! The receiver owns its storage. A restart ([`Receiver::restart`]) throws away
 //! everything in memory and rebuilds it from storage alone.
 //!
-//! If a panic ever escapes a commit (a bug), the receiver can't vouch for its
-//! memory, so it changes nothing more until a restart rebuilds it from
-//! storage: see [`Receiver::is_halted`]. Storage is always written first, so it
-//! is never behind what memory may hold.
+//! If a panic ever escapes a commit (a bug, or storage failing mid-write), the
+//! receiver can't vouch for its memory, so before its next command it rebuilds
+//! memory from storage, as a restart would: see [`Receiver::recover`].
 
 use std::fmt;
 
@@ -205,7 +204,7 @@ impl<S: Storage> Receiver<S> {
     /// the restart floor, but otherwise valid, still moves its camera to its
     /// key (see `Decision::BelowRestartFloor`).
     pub fn receive(&mut self, frame_hex: &str) -> Result<Accepted<'_>, ReceiveError> {
-        if self.is_halted() {
+        if !self.recover() {
             return Err(ReceiveError::Halted);
         }
         match Self::plan(&self.memory, &mut self.scratch, frame_hex)? {
@@ -220,11 +219,22 @@ impl<S: Storage> Receiver<S> {
         }
     }
 
-    /// Whether an earlier commit was interrupted, so the receiver refuses to
-    /// change anything until it is restarted.
+    /// Whether an earlier commit was interrupted and memory hasn't been rebuilt
+    /// since: memory may be half-changed, so nothing may change it.
     #[must_use]
     pub const fn is_halted(&self) -> bool {
         self.memory.commit_in_progress
+    }
+
+    /// After a panic interrupted a commit, rebuilds memory from storage, as a
+    /// power cut at that moment would. Storage is written before memory, and
+    /// each write is all or nothing, so it holds the state from just before
+    /// the interrupted command or just after it, and the restart rules cover
+    /// both. Returns whether the receiver may change state again: `false` only
+    /// if storage couldn't be read, in which case nothing changed, the
+    /// receiver stays halted, and the next command tries again.
+    pub fn recover(&mut self) -> bool {
+        !self.is_halted() || self.restart().is_ok()
     }
 
     /// Runs every check, in order, and computes the frame's effects. Reads
@@ -333,8 +343,9 @@ impl<S: Storage> Receiver<S> {
 
     /// Marks a commit as in progress, then writes the given records (skipping
     /// `None`s) to storage. If the write fails, nothing was written, so the
-    /// commit is abandoned and the receiver carries on unchanged. A panic from
-    /// here until the commit ends leaves the receiver halted.
+    /// commit is abandoned and the receiver carries on unchanged. A panic between
+    /// here and the end of the commit leaves the receiver halted until
+    /// [`Receiver::recover`] rebuilds memory from storage.
     fn begin_commit(&mut self, records: &[Option<Record<'_>>]) -> Result<(), StorageError> {
         self.memory.commit_in_progress = true;
         let records: Vec<Record<'_>> = records.iter().flatten().copied().collect();
@@ -369,7 +380,7 @@ impl<S: Storage> Receiver<S> {
         key_id: KeyId,
         key: Key,
     ) -> Result<(), KeyCommandError> {
-        if self.is_halted() {
+        if !self.recover() {
             return Err(KeyCommandError::Halted);
         }
         let next = self
@@ -398,7 +409,7 @@ impl<S: Storage> Receiver<S> {
     ///
     /// Refuses a key id that was never provisioned.
     pub fn revoke_key(&mut self, camera: Camera, key_id: KeyId) -> Result<(), KeyCommandError> {
-        if self.is_halted() {
+        if !self.recover() {
             return Err(KeyCommandError::Halted);
         }
         let next = self
@@ -481,7 +492,8 @@ pub enum ReceiveError {
     Tree(TreeError),
     /// The frame couldn't be saved to storage, so it wasn't accepted.
     Storage(StorageError),
-    /// An earlier commit was interrupted; frames are refused until a restart.
+    /// An earlier commit was interrupted, and memory couldn't be rebuilt from
+    /// storage; frames are refused until it can be.
     Halted,
     /// A calculation that the checks make impossible failed.
     Internal,
@@ -515,7 +527,7 @@ impl fmt::Display for ReceiveError {
             Self::Tree(error) => write!(f, "malformed frame: {error}"),
             Self::Storage(error) => write!(f, "{error}: frame not accepted"),
             Self::Halted => f.write_str(
-                "receiver halted: an internal error interrupted an earlier command, so its state can't be trusted until a restart",
+                "receiver halted: an internal error interrupted an earlier command, and its state couldn't be reloaded from storage",
             ),
             Self::Internal => f.write_str("internal error"),
         }
@@ -586,11 +598,12 @@ mod tests {
     const SPEC_FRAME: &str = "01010000000100000000000003e8001f010000000101000000020000010000000301000000040000010000000500\
                               00fe04b3dcfd1aa96276d46024a02a89e9125a556fa6a3e1b14628fb7cd4375d82";
 
-    /// Storage whose writes can be made to fail.
+    /// Storage whose writes, or reads, can be made to fail.
     #[derive(Debug, Default)]
     struct FlakyStore {
         inner: MemoryStore,
         fail: bool,
+        unreadable: bool,
     }
 
     impl Storage for FlakyStore {
@@ -602,6 +615,9 @@ mod tests {
         }
 
         fn load(&self) -> Result<Saved, StorageError> {
+            if self.unreadable {
+                return Err(StorageError::NothingSaved);
+            }
             self.inner.load()
         }
     }
@@ -713,12 +729,35 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_commit_halts_the_receiver_until_a_restart() {
+    fn an_interrupted_commit_is_rebuilt_from_storage_before_the_next_command() {
         let mut r = receiver();
         r.receive(SPEC_FRAME).unwrap();
         // As if a panic had escaped the middle of a commit.
         r.memory.commit_in_progress = true;
         assert!(r.is_halted());
+        // The next command first rebuilds memory from storage, as a restart
+        // would: storage holds floor 101, so seq 1 is refused by the floor.
+        assert_eq!(
+            r.receive(SPEC_FRAME),
+            Err(ReceiveError::Stale {
+                camera: Camera::Cam1,
+                seq: 1
+            })
+        );
+        assert!(!r.is_halted());
+        assert_eq!(r.state().cameras.get(Camera::Cam1).last_seq, None);
+        // Recovering a receiver that isn't halted changes nothing.
+        let before = r.state();
+        assert!(r.recover());
+        assert_eq!(r.state(), before);
+    }
+
+    #[test]
+    fn an_interrupted_commit_stays_halted_while_storage_cant_be_read() {
+        let mut r = receiver();
+        r.receive(SPEC_FRAME).unwrap();
+        r.memory.commit_in_progress = true;
+        r.store.unreadable = true;
         assert_eq!(r.receive(SPEC_FRAME), Err(ReceiveError::Halted));
         let key = Key::from_hex(&"11".repeat(32)).unwrap();
         assert_eq!(
@@ -733,14 +772,14 @@ mod tests {
             KeyCommandError::Halted.to_string(),
             ReceiveError::Halted.to_string()
         );
+        assert!(!r.recover());
         // Nothing changed, and state is still reported, for diagnosis.
+        assert!(r.is_halted());
         assert_eq!(statuses(&r), vec![KeyStatus::Active]);
         assert_eq!(r.state().cameras.get(Camera::Cam1).last_seq, Some(1));
 
-        // A restart rebuilds memory from storage, which is never behind.
-        r.restart().unwrap();
-        assert!(!r.is_halted());
-        assert_eq!(r.state().cameras.get(Camera::Cam1).last_seq, None);
+        // Once storage can be read again, the next command recovers.
+        r.store.unreadable = false;
         assert_eq!(
             r.receive(SPEC_FRAME),
             Err(ReceiveError::Stale {
@@ -748,6 +787,7 @@ mod tests {
                 seq: 1
             })
         );
+        assert!(!r.is_halted());
     }
 
     #[test]

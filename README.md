@@ -46,15 +46,15 @@ Transcripts, the demo session included, are plain text: `# ` lines are comments,
 
 | Test | Run with | What it checks | In CI |
 |---|---|---|---|
-| Unit tests, `src/*.rs` | `cargo test --lib` | Each module, including its boundary values | Yes |
+| Unit tests, `src/*.rs` | `cargo test --lib` | Each module, including its boundary values, plus a property test: every random tree within the limits decodes to the right level order | Yes |
 | Spec examples, `tests/transcripts.rs` | `cargo test --test transcripts` | The project description's three examples, response by response, and the demo session | Yes |
 | Rules, `tests/rules.rs` | `cargo test --test rules` | The order of checks, input rules, error messages, extreme values, and the choices for the spec's open questions on tree limits, rejected payloads and wide pair windows | Yes |
 | Keys, `tests/keys.rs` | `cargo test --test keys` | Key rotation, retirement and revocation, and each `add_key` and `revoke_key` error | Yes |
 | Restarts, `tests/restart.rs` | `cargo test --test restart` | Each restart rule and the storage write counts, plus a property test: a receiver that restarts never accepts a frame that a twin which never restarts rejects | Yes |
 | Reference model, `tests/model.rs` | `cargo test --test model` | Property tests: random command sequences get exactly the responses of a separate, plain implementation of the spec, and random lines and frame bytes never cause an internal error | Yes |
-| Safety net, `tests/safety_net.rs` | `cargo test --test safety_net` | A storage fault in the middle of a command halts the receiver, and a restart recovers it | Yes |
+| Safety net, `tests/safety_net.rs` | `cargo test --test safety_net` | A storage fault in the middle of a command gets an internal error, and the receiver rebuilds its memory from storage before the next one | Yes |
 | Command line, `tests/cli.rs` | `cargo test --test cli` | The real binary over stdin and stdout | Yes |
-| Keys in memory, `tests/memory.rs` | `cargo test --test memory`<br>Linux only: it reads the receiver's memory through `/proc/<pid>/mem`, which macOS doesn't have, so on a Mac `cargo test` skips it | No copy of a retired or revoked key, and no key text, is left in the running receiver's memory<br>Run as a release build (`--release`), it also checks the stack scrub: right after a frame is checked, the active key is nowhere else. Only a release build leaves a copy of the key on the stack for the scrub to erase | Yes, on Linux |
+| Keys in memory, `tests/memory.rs` | `cargo test --test memory`<br>Linux only: it reads the receiver's memory through `/proc/<pid>/mem`, which macOS doesn't have, so on a Mac `cargo test` skips it | No copy of a retired or revoked key, nor any form HMAC derives from it, and no key text, is left in the running receiver's memory<br>Run as a release build (`--release`), it also checks the stack scrub: right after a frame is checked, the active key is nowhere else. Only a release build leaves a copy of the key on the stack for the scrub to erase | Yes, on Linux |
 | Soak, `tests/soak.rs` | `cargo test --test soak` | A long mixed stream through the real binary, including full-size trees and the largest possible frame: every command gets the right kind of response within 10 seconds, memory stays flat after warming up, and it reports commands per second | Yes: 5,000 commands in debug builds, 50,000 in release |
 
 ### Tools
@@ -79,6 +79,7 @@ CI runs on every push and pull request (`.github/workflows/ci.yml`). It runs the
 ```
 PROPTEST_CASES=100000 cargo test --release --test model                 # random cases per property test (default 400)
 PROPTEST_CASES=100000 cargo test --release --test restart               # the same for the twin test (default 500)
+PROPTEST_CASES=100000 cargo test --release --lib tree                   # the same for the tree test (default 256)
 SOAK_COMMANDS=1000000 cargo test --release --test soak -- --nocapture   # commands; prints commands per second
 fuzz/run.sh receiver 3600                                               # seconds of fuzzing
 ```
@@ -110,7 +111,7 @@ tests/          the tests in the table above, their shared helpers in support/,
                 the spec's example transcripts in transcripts/, and the benchmark in bench.rs
 fuzz/           fuzz targets, seeds and dictionary (a separate crate)
 demo/           the presentation demo: run.sh and the session it plays
-docs/           the diagrams in DESIGN.md
+docs/           the presentation slides (PDF)
 scripts/        mutants.sh: mutation testing, with a pass or fail for this platform
                 bench.sh: throughput, one kind of frame at a time
 ```
