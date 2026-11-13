@@ -17,12 +17,16 @@ cargo build --release
 
 The receiver reads one JSON command per line on stdin and writes one JSON response per line on stdout. The commands, their parameters and their responses are defined in the project description, which isn't included in this repository; `demo/session.txt` has a worked example of each command.
 
-Start it and type or paste commands; each response prints right away. The first command must be `init`, such as this one from the project description:
+Start it and type or paste commands; each response prints on the next line. The first command must be `init`. This session, from the project description's examples, sets up the two cameras and then receives one frame from each. The second frame's response pairs the two under `synced`:
 
 ```
 cargo run --release
 {"command":"init","parameters":{"period_ms":50,"max_jitter_ms":5,"pair_window_ms":20,"max_pending":4,"keys":{"cam1":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","cam2":"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"}}}
-{"command":"get_state","parameters":{}}
+{"status":"ok","payload":{"cameras":{"cam1":{"last_seq":null,"last_timestamp":null,"pending":[],"keys":[{"key_id":0,"status":"active"}]},"cam2":{"last_seq":null,"last_timestamp":null,"pending":[],"keys":[{"key_id":0,"status":"active"}]}}}}
+{"command":"receive","parameters":{"frame":"01010000000100000000000003e8001f01000000010100000002000001000000030100000004000001000000050000fe04b3dcfd1aa96276d46024a02a89e9125a556fa6a3e1b14628fb7cd4375d82"}}
+{"status":"ok","payload":{"frame":{"camera":"cam1","key_id":0,"seq":1,"timestamp":1000,"corrected":false,"tree":[1,2,3,null,null,4,5]},"synced":[]}}
+{"command":"receive","parameters":{"frame":"01020000000100000000000003ed00010096af248e74798001df0e27b21440c4b3bf99400f3ea51076772b84dea76ebcc2"}}
+{"status":"ok","payload":{"frame":{"camera":"cam2","key_id":0,"seq":1,"timestamp":1005,"corrected":false,"tree":[]},"synced":[{"timestamp":1002,"cam1":1,"cam2":1}]}}
 ```
 
 To run a file of commands instead, one per line: `cargo run --release < FILE`.
@@ -126,7 +130,7 @@ The project was built in the spec's three stages, and each finished stage is tag
 | `v2-keys` | Follow-on 1 | Key rotation and revocation: version 2 frames with a key id, `add_key` and `revoke_key` |
 | `v3-restart` | Follow-on 2 | `restart` and `persist_interval`: replay protection that survives a restart, within the storage write budget |
 
-`main` builds on `v3-restart` with CI, fuzzing, mutation testing, the fixes from an independent security review and a code review, the demo, the soak test, tests at the size limits, work buffers reserved once and reused, the throughput benchmark, and rules for AI coding agents (`AGENTS.md`).
+`main` builds on `v3-restart` with CI, fuzzing, mutation testing, the fixes from a security review and a code review, the demo, the soak test, tests at the size limits, work buffers reserved once and reused, the throughput benchmark, and rules for AI coding agents (`AGENTS.md`).
 
 ```
 git checkout v2-keys        # look at a stage; git checkout main to come back
