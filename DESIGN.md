@@ -295,7 +295,7 @@ Rationale:
 | Soak | `cargo test --test soak` | Correct response to mixed traffic |
 | Fuzzing | `fuzz/run.sh <target> 60`, where the target is `tree`, `command_line`, or `receiver` | 60 seconds of fuzzing per target |
 | Coverage | `cargo llvm-cov --summary-only` | Runs `cargo test` and reports coverage |
-| Dependencies | `cargo deny check` | Known vulnerabilities, licenses, sources, and the four-library allowlist |
+| Dependencies | `cargo deny check` | Known vulnerabilities, licenses, sources, and the spec's allowlist |
 
 ### Run on Request
 
