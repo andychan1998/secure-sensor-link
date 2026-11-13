@@ -120,14 +120,18 @@ fn derived_forms_are_what_hmac_uses() {
 }
 
 /// Run in a child process by `the_search_finds_the_states_of_a_live_hmac`:
-/// keeps an HMAC in use until its stdin closes. Does nothing otherwise.
+/// keeps an HMAC in use until its stdin closes. Does nothing otherwise. The
+/// HMAC is boxed and the child uses a single malloc arena, so a copy sits in
+/// the main heap, where the receiver keeps its keys. On GitHub's Linux
+/// runners, the search didn't find it while it was only on this test thread's
+/// stack.
 #[test]
 #[ignore = "run by the_search_finds_the_states_of_a_live_hmac"]
 fn hold_an_hmac_while_stdin_is_open() {
     if std::env::var_os("HOLD_HMAC").is_none() {
         return;
     }
-    let mac = Hmac::<Sha256>::new_from_slice(&hex::decode(CAM2_KEY0).unwrap()).unwrap();
+    let mac = Box::new(Hmac::<Sha256>::new_from_slice(&hex::decode(CAM2_KEY0).unwrap()).unwrap());
     let mut stdout = std::io::stdout();
     writeln!(stdout, "ready").unwrap();
     stdout.flush().unwrap();
@@ -148,13 +152,16 @@ fn the_search_finds_the_states_of_a_live_hmac() {
             "--nocapture",
         ])
         .env("HOLD_HMAC", "1")
+        .env("MALLOC_ARENA_MAX", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    // When the harness runs one test at a time, it prints "ready" on the
+    // test's own "test ..." line, so look only at the end of each line.
     let mut line = String::new();
-    while line.trim() != "ready" {
+    while !line.trim_end().ends_with("ready") {
         line.clear();
         assert_ne!(
             stdout.read_line(&mut line).unwrap(),
@@ -163,7 +170,11 @@ fn the_search_finds_the_states_of_a_live_hmac() {
         );
     }
     for (form, bytes) in &derived_forms(&hex::decode(CAM2_KEY0).unwrap())[2..] {
-        assert!(copies_in_memory(child.id(), bytes) >= 1, "{form} not found");
+        let (regions, unread) = memory_of(child.id());
+        assert!(
+            copies(&regions, bytes) >= 1,
+            "{form} not found; regions that couldn't be read: {unread:?}"
+        );
     }
     drop(child.stdin.take());
     assert!(child.wait().unwrap().success());
@@ -171,14 +182,32 @@ fn the_search_finds_the_states_of_a_live_hmac() {
 
 /// How many times `needle` appears in the readable memory of process `pid`.
 fn copies_in_memory(pid: u32, needle: &[u8]) -> usize {
+    copies(&memory_of(pid).0, needle)
+}
+
+/// How many times `needle` appears in `regions`.
+fn copies(regions: &[Vec<u8>], needle: &[u8]) -> usize {
+    regions
+        .iter()
+        .map(|data| {
+            data.windows(needle.len())
+                .filter(|window| window == &needle)
+                .count()
+        })
+        .sum()
+}
+
+/// The readable memory of process `pid`, one region at a time, and the lines
+/// of `/proc/<pid>/maps` for regions marked readable that couldn't be read.
+fn memory_of(pid: u32) -> (Vec<Vec<u8>>, Vec<String>) {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
     let mut mem = File::open(format!("/proc/{pid}/mem")).unwrap();
-    let mut count = 0;
+    let (mut regions, mut unread) = (Vec::new(), Vec::new());
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
         let (range, perms) = (fields.next().unwrap(), fields.next().unwrap());
         let name = fields.nth(3).unwrap_or("");
-        if !perms.starts_with('r') || name == "[vvar]" || name == "[vsyscall]" {
+        if !perms.starts_with('r') || name.starts_with("[vvar") || name == "[vsyscall]" {
             continue;
         }
         let (start, end) = range.split_once('-').unwrap();
@@ -186,14 +215,12 @@ fn copies_in_memory(pid: u32, needle: &[u8]) -> usize {
         let end = u64::from_str_radix(end, 16).unwrap();
         let mut data = vec![0; usize::try_from(end - start).unwrap()];
         if mem.seek(SeekFrom::Start(start)).is_err() || mem.read_exact(&mut data).is_err() {
+            unread.push(line.to_owned());
             continue;
         }
-        count += data
-            .windows(needle.len())
-            .filter(|window| window == &needle)
-            .count();
+        regions.push(data);
     }
-    count
+    (regions, unread)
 }
 
 #[test]

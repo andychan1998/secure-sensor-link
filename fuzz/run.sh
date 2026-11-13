@@ -8,6 +8,11 @@
 #   cargo +nightly fuzz run <target> <that file>
 # FUZZ_TOOLCHAIN picks the toolchain (nightly by default; cargo-fuzz needs it).
 set -eu
+toolchain=${FUZZ_TOOLCHAIN:-nightly}
+# Build for this machine's own target. Otherwise cargo-fuzz builds for the
+# target it was itself built for, which for a prebuilt cargo-fuzz (as CI
+# installs) is musl, and the address sanitizer can't run there.
+host=$(rustc "+$toolchain" -vV | sed -n 's/^host: //p')
 
 target=${1:?usage: fuzz/run.sh command_line|receiver|tree [seconds]}
 seconds=${2:-600}
@@ -23,4 +28,4 @@ set -- "$@" -- "-max_total_time=$seconds"
 if [ -f "fuzz/$target.dict" ]; then
     set -- "$@" "-dict=fuzz/$target.dict"
 fi
-exec cargo "+${FUZZ_TOOLCHAIN:-nightly}" fuzz run "$target" "$@"
+exec cargo "+$toolchain" fuzz run --target "$host" "$target" "$@"
